@@ -116,7 +116,16 @@ zig-out/bin/nullclaw migrate openclaw
 
 ### Install `nullclaw` Command (Cross-Platform)
 
-Install into a user prefix (puts binary into `<prefix>/bin`):
+If you already use Homebrew (macOS/Linux), install into Homebrew's `bin` (usually already on `PATH`):
+
+```bash
+zig build -Doptimize=ReleaseSmall
+mkdir -p "$(brew --prefix)/bin"
+ln -sf "$PWD/zig-out/bin/nullclaw" "$(brew --prefix)/bin/nullclaw"
+nullclaw --help
+```
+
+Otherwise, install into a user prefix (puts binary into `<prefix>/bin`):
 
 ```bash
 zig build -Doptimize=ReleaseSmall -p "$HOME/.local"
