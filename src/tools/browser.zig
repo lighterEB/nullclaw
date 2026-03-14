@@ -112,6 +112,13 @@ pub const BrowserTool = struct {
         const url = root.getString(args, "url") orelse
             return ToolResult.fail("Missing 'url' parameter for read action");
 
+        if (url.len > 0 and url[0] == '-') {
+            return ToolResult.fail("Invalid URL for read action");
+        }
+        if (!std.mem.startsWith(u8, url, "https://")) {
+            return ToolResult.fail("Only https:// URLs are supported for security");
+        }
+
         // Use curl to fetch the page. Flags:
         //   -sS  silent but show errors
         //   -L   follow redirects
@@ -119,7 +126,7 @@ pub const BrowserTool = struct {
         //   --max-filesize 65536  abort if body exceeds 64 KB
         const max_size_str = std.fmt.comptimePrint("{d}", .{MAX_FETCH_BYTES});
         const proc = @import("process_util.zig");
-        const result = proc.run(allocator, &.{ "curl", "-sS", "-L", "-m", "10", "--max-filesize", max_size_str, url }, .{ .max_output_bytes = MAX_FETCH_BYTES }) catch {
+        const result = proc.run(allocator, &.{ "curl", "-sS", "-L", "-m", "10", "--max-filesize", max_size_str, "--", url }, .{ .max_output_bytes = MAX_FETCH_BYTES }) catch {
             return ToolResult.fail("Failed to spawn curl — is curl installed?");
         };
         defer allocator.free(result.stderr);
@@ -232,6 +239,26 @@ test "browser read missing url" {
     const result = try t.execute(std.testing.allocator, parsed.value.object);
     try std.testing.expect(!result.success);
     try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "url") != null);
+}
+
+test "browser read rejects http" {
+    var bt = BrowserTool{};
+    const t = bt.tool();
+    const parsed = try root.parseTestArgs("{\"action\": \"read\", \"url\": \"http://example.com\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "https") != null);
+}
+
+test "browser read rejects option-like url" {
+    var bt = BrowserTool{};
+    const t = bt.tool();
+    const parsed = try root.parseTestArgs("{\"action\": \"read\", \"url\": \"--help\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "Invalid") != null);
 }
 
 test "browser open returns output with URL" {
