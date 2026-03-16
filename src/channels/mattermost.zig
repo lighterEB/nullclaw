@@ -4,6 +4,10 @@ const root = @import("root.zig");
 const websocket = @import("../websocket.zig");
 const bus_mod = @import("../bus.zig");
 const config_types = @import("../config_types.zig");
+const url_percent = @import("../url_percent.zig");
+const thread_stacks = @import("../thread_stacks.zig");
+
+const Atomic = @import("../portable_atomic.zig").Atomic;
 
 const log = std.log.scoped(.mattermost);
 
@@ -75,11 +79,11 @@ pub const MattermostChannel = struct {
     bus: ?*bus_mod.Bus = null,
     dedup: DedupRing = .{},
 
-    running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    connected: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    ws_seq: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    tmp_counter: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    ws_fd: std.atomic.Value(SocketFd) = std.atomic.Value(SocketFd).init(invalid_socket),
+    running: Atomic(bool) = Atomic(bool).init(false),
+    connected: Atomic(bool) = Atomic(bool).init(false),
+    ws_seq: Atomic(u64) = Atomic(u64).init(0),
+    tmp_counter: Atomic(u64) = Atomic(u64).init(0),
+    ws_fd: Atomic(SocketFd) = Atomic(SocketFd).init(invalid_socket),
     gateway_thread: ?std.Thread = null,
 
     bot_state_mu: std.Thread.Mutex = .{},
@@ -332,7 +336,7 @@ pub const MattermostChannel = struct {
         self.running.store(true, .release);
         errdefer self.running.store(false, .release);
         self.connected.store(false, .release);
-        self.gateway_thread = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, gatewayLoop, .{self});
+        self.gateway_thread = try std.Thread.spawn(.{ .stack_size = thread_stacks.HEAVY_RUNTIME_STACK_SIZE }, gatewayLoop, .{self});
     }
 
     fn vtableStop(ptr: *anyopaque) void {
@@ -431,6 +435,8 @@ pub const MattermostChannel = struct {
         var path_buf: [1024]u8 = undefined;
         const parts = try self.websocketConnectParts(&host_buf, &path_buf);
 
+        log.info("mattermost: connecting to wss://{s}:{d}{s}", .{ parts.host, parts.port, parts.path });
+
         var ws = try websocket.WsClient.connect(
             self.allocator,
             parts.host,
@@ -459,6 +465,7 @@ pub const MattermostChannel = struct {
         try auth_list.appendSlice(self.allocator, "}}");
 
         try ws.writeText(auth_list.items);
+        log.info("mattermost: websocket authenticated", .{});
 
         while (self.running.load(.acquire)) {
             const maybe_text = ws.readTextMessage() catch |err| switch (err) {
@@ -842,18 +849,8 @@ fn componentAsSlice(component: std.Uri.Component) []const u8 {
     };
 }
 
-fn isUnreserved(c: u8) bool {
-    return std.ascii.isAlphanumeric(c) or c == '-' or c == '_' or c == '.' or c == '~';
-}
-
 fn appendUrlEncoded(writer: anytype, text: []const u8) !void {
-    for (text) |c| {
-        if (isUnreserved(c)) {
-            try writer.writeByte(c);
-        } else {
-            try writer.print("%{X:0>2}", .{c});
-        }
-    }
+    try url_percent.appendPercentEncodedWriter(writer, text);
 }
 
 fn parseTarget(target: []const u8) !ParsedTarget {

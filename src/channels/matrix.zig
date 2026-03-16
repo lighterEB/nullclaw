@@ -2,13 +2,15 @@ const std = @import("std");
 const builtin = @import("builtin");
 const root = @import("root.zig");
 const config_types = @import("../config_types.zig");
+const url_percent = @import("../url_percent.zig");
 
 const log = std.log.scoped(.matrix);
 
 /// Matrix channel via Client-Server API.
 ///
 /// - Inbound: long-poll /_matrix/client/v3/sync
-/// - Outbound: POST /_matrix/client/v3/rooms/{roomId}/send/m.room.message/{txnId}
+/// - Outbound: PUT /_matrix/client/v3/rooms/{roomId}/send/m.room.message/{txnId}
+/// - Typing: PUT /_matrix/client/v3/rooms/{roomId}/typing/{userId}
 pub const MatrixChannel = struct {
     allocator: std.mem.Allocator,
     account_id: []const u8 = "default",
@@ -155,7 +157,7 @@ pub const MatrixChannel = struct {
         defer self.allocator.free(auth_header);
 
         const headers = [_][]const u8{auth_header};
-        const resp = try root.http_util.curlPost(self.allocator, url, body_list.items, &headers);
+        const resp = try root.http_util.curlPut(self.allocator, url, body_list.items, &headers);
         defer self.allocator.free(resp);
 
         if (std.mem.indexOf(u8, resp, "\"event_id\"") == null) {
@@ -192,7 +194,7 @@ pub const MatrixChannel = struct {
         defer self.allocator.free(auth_header);
         const headers = [_][]const u8{auth_header};
 
-        const resp = root.http_util.curlPost(
+        const resp = root.http_util.curlPut(
             self.allocator,
             url,
             "{\"typing\":true,\"timeout\":15000}",
@@ -519,23 +521,8 @@ fn stripTrailingSlashes(url: []const u8) []const u8 {
     return url[0..end];
 }
 
-fn isUnreserved(c: u8) bool {
-    return std.ascii.isAlphanumeric(c) or c == '-' or c == '_' or c == '.' or c == '~';
-}
-
 fn appendUrlEncoded(writer: anytype, text: []const u8) !void {
-    for (text) |c| {
-        if (isUnreserved(c)) {
-            try writer.writeByte(c);
-        } else {
-            var esc: [3]u8 = undefined;
-            const upper = "0123456789ABCDEF";
-            esc[0] = '%';
-            esc[1] = upper[(c >> 4) & 0x0F];
-            esc[2] = upper[c & 0x0F];
-            try writer.writeAll(&esc);
-        }
-    }
+    try url_percent.appendPercentEncodedWriter(writer, text);
 }
 
 fn toOwnedMessages(

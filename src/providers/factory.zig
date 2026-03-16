@@ -60,7 +60,7 @@ const CompatProvider = struct {
 };
 
 const compat_providers = [_]CompatProvider{
-    // ── Major Cloud Providers ───────────────────────────────────────────────────────
+    // ── Major Cloud Providers ─────────────────────────────────────────────
     .{ .name = "groq", .url = "https://api.groq.com/openai/v1", .display = "Groq" },
     .{ .name = "mistral", .url = "https://api.mistral.ai/v1", .display = "Mistral" },
     .{ .name = "deepseek", .url = "https://api.deepseek.com", .display = "DeepSeek" },
@@ -697,20 +697,96 @@ test "fromConfig applies native_tools override for ollama" {
     try std.testing.expect(!h.provider().supportsNativeTools());
 }
 
-test "fromConfig creates correct holder variants" {
+test "fromConfig applies max_tokens_non_streaming from table" {
+    const alloc = std.testing.allocator;
+    var h = ProviderHolder.fromConfig(alloc, "fireworks", "key", null, true, null);
+    defer h.deinit();
+    try std.testing.expect(h == .compatible);
+    try std.testing.expectEqual(@as(?u32, 4096), h.compatible.max_tokens_non_streaming);
+}
+
+test "detectProviderByApiKey openrouter" {
+    try std.testing.expect(detectProviderByApiKey("sk-or-v1-abc123") == .openrouter_provider);
+}
+
+test "detectProviderByApiKey anthropic" {
+    try std.testing.expect(detectProviderByApiKey("sk-ant-api03-abc123") == .anthropic_provider);
+}
+
+test "detectProviderByApiKey openai" {
+    try std.testing.expect(detectProviderByApiKey("sk-proj-abc123") == .openai_provider);
+}
+
+test "detectProviderByApiKey groq" {
+    try std.testing.expect(detectProviderByApiKey("gsk_abc123def456") == .compatible_provider);
+}
+
+test "detectProviderByApiKey xai" {
+    try std.testing.expect(detectProviderByApiKey("xai-abc123") == .compatible_provider);
+}
+
+test "detectProviderByApiKey perplexity" {
+    try std.testing.expect(detectProviderByApiKey("pplx-abc123") == .compatible_provider);
+}
+
+test "detectProviderByApiKey aws" {
+    try std.testing.expect(detectProviderByApiKey("AKIAIOSFODNN7EXAMPLE") == .compatible_provider);
+}
+
+test "detectProviderByApiKey gemini" {
+    try std.testing.expect(detectProviderByApiKey("AIzaSyAbc123") == .gemini_provider);
+}
+
+test "detectProviderByApiKey vertex oauth token" {
+    try std.testing.expect(detectProviderByApiKey("ya29.a0AfH6SMD-abc123") == .vertex_provider);
+}
+
+test "detectProviderByApiKey unknown" {
+    try std.testing.expect(detectProviderByApiKey("random-key") == .unknown);
+}
+
+test "detectProviderByApiKey short key" {
+    try std.testing.expect(detectProviderByApiKey("ab") == .unknown);
+}
+
+test "ProviderHolder tagged union has all expected fields" {
+    try std.testing.expect(@hasField(ProviderHolder, "openrouter"));
+    try std.testing.expect(@hasField(ProviderHolder, "anthropic"));
+    try std.testing.expect(@hasField(ProviderHolder, "openai"));
+    try std.testing.expect(@hasField(ProviderHolder, "gemini"));
+    try std.testing.expect(@hasField(ProviderHolder, "vertex"));
+    try std.testing.expect(@hasField(ProviderHolder, "ollama"));
+    try std.testing.expect(@hasField(ProviderHolder, "compatible"));
+    try std.testing.expect(@hasField(ProviderHolder, "claude_cli"));
+    try std.testing.expect(@hasField(ProviderHolder, "codex_cli"));
+    try std.testing.expect(@hasField(ProviderHolder, "openai_codex"));
+}
+
+test "ProviderHolder.fromConfig routes to correct variant" {
     const alloc = std.testing.allocator;
     // anthropic
-    var h1 = ProviderHolder.fromConfig(alloc, "anthropic", "sk-ant-test", null, true, null);
+    var h1 = ProviderHolder.fromConfig(alloc, "anthropic", "sk-test", null, true, null);
     defer h1.deinit();
     try std.testing.expect(h1 == .anthropic);
     // openai
     var h2 = ProviderHolder.fromConfig(alloc, "openai", "sk-test", null, true, null);
     defer h2.deinit();
     try std.testing.expect(h2 == .openai);
+    // azure openai
+    var h2a = ProviderHolder.fromConfig(alloc, "azure", "test-key", "https://test.openai.azure.com", true, null);
+    defer h2a.deinit();
+    try std.testing.expect(h2a == .compatible);
+    try std.testing.expectEqualStrings("https://test.openai.azure.com/openai/v1", h2a.compatible.base_url);
+    try std.testing.expect(h2a.compatible.auth_style == .custom);
+    try std.testing.expectEqualStrings("api-key", h2a.compatible.custom_header.?);
     // gemini
-    var h3 = ProviderHolder.fromConfig(alloc, "gemini", "AIza-test", null, true, null);
+    var h3 = ProviderHolder.fromConfig(alloc, "gemini", "key", null, true, null);
     defer h3.deinit();
     try std.testing.expect(h3 == .gemini);
+    // vertex
+    var h3b = ProviderHolder.fromConfig(alloc, "vertex", "ya29.token", "https://aiplatform.googleapis.com/v1/projects/p/locations/global/publishers/google/models", true, null);
+    defer h3b.deinit();
+    try std.testing.expect(h3b == .vertex);
     // ollama
     var h4 = ProviderHolder.fromConfig(alloc, "ollama", null, null, true, null);
     defer h4.deinit();

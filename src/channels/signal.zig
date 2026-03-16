@@ -26,7 +26,7 @@
 //! ```
 //!
 //! Environment variable override:
-//!   SIGNAL_HTTP_URL, SIGNAL_ACCOUNT
+//!   SIGNAL_HTTP_URL, SIGNAL_ACCOUNT, SIGNAL_USE_REST_API
 //!
 //! Prerequisites:
 //!   signal-cli must be running in daemon mode:
@@ -36,8 +36,10 @@ const std = @import("std");
 const builtin = @import("builtin");
 const root = @import("root.zig");
 const config_types = @import("../config_types.zig");
+const fs_compat = @import("../fs_compat.zig");
 const sse_client = @import("../sse_client.zig");
 const platform = @import("../platform.zig");
+const thread_stacks = @import("../thread_stacks.zig");
 
 const log = std.log.scoped(.signal);
 
@@ -72,6 +74,20 @@ const SIGNAL_RPC_ENDPOINT = "/api/v1/rpc";
 /// SSE endpoint for receiving messages.
 const SIGNAL_SSE_ENDPOINT = "/api/v1/events";
 
+/// Signal reserves device id 1 for the primary device. Linked devices use
+/// other ids; we use this to accept Note-to-Self only from the primary device
+/// and fail closed for sync echoes originating from linked devices.
+const SIGNAL_PRIMARY_DEVICE_ID: u64 = 1;
+
+/// REST health endpoint (signal-cli-rest-api MODE=normal).
+const SIGNAL_REST_HEALTH_ENDPOINT = "/v1/health";
+
+/// REST endpoint for sending messages.
+const SIGNAL_REST_SEND_ENDPOINT = "/v2/send";
+
+/// REST receive endpoint prefix for polling messages.
+const SIGNAL_REST_RECEIVE_ENDPOINT = "/v1/receive/";
+
 /// Maximum message length for Signal messages (signal-cli has no hard limit,
 /// but we chunk at 4096 to match typical messenger UX).
 pub const MAX_MESSAGE_LEN: usize = 4096;
@@ -92,11 +108,10 @@ pub const RecipientTarget = union(enum) {
 // Signal Channel
 // ════════════════════════════════════════════════════════════════════════════
 
-/// Signal channel — uses signal-cli daemon's native JSON-RPC + SSE API.
+/// Signal channel with dual transport support.
 ///
-/// Sends messages via JSON-RPC POST to `/api/v1/rpc`.
-/// The SSE listener (for incoming messages) uses streaming HTTP for
-/// real-time message delivery.
+/// Default mode uses signal-cli daemon JSON-RPC + SSE.
+/// When SIGNAL_USE_REST_API=1, uses signal-cli-rest-api REST endpoints.
 pub const SignalChannel = struct {
     allocator: std.mem.Allocator,
     account_id: []const u8 = "default",
@@ -116,6 +131,8 @@ pub const SignalChannel = struct {
     ignore_attachments: bool,
     /// Skip story messages.
     ignore_stories: bool,
+    /// Transport switch (env-gated): false = daemon JSON-RPC/SSE, true = REST.
+    use_rest_api: bool = false,
     /// Persistent SSE connection for streaming message delivery.
     /// Initialized on first poll, maintained across polls for real-time delivery.
     sse_conn: ?sse_client.SseConnection = null,
@@ -155,6 +172,7 @@ pub const SignalChannel = struct {
             .group_policy = "allowlist",
             .ignore_attachments = ignore_attachments,
             .ignore_stories = ignore_stories,
+            .use_rest_api = if (builtin.is_test) false else envFlagEnabled(allocator, "SIGNAL_USE_REST_API"),
         };
     }
 
@@ -205,12 +223,36 @@ pub const SignalChannel = struct {
         return fbs.getWritten();
     }
 
+    /// Build REST send URL.
+    pub fn sendUrl(self: *const SignalChannel, buf: []u8) ![]const u8 {
+        var fbs = std.io.fixedBufferStream(buf);
+        const w = fbs.writer();
+        try w.writeAll(self.http_url);
+        try w.writeAll(SIGNAL_REST_SEND_ENDPOINT);
+        return fbs.getWritten();
+    }
+
+    /// Build REST receive polling URL.
+    pub fn receivePollUrl(self: *const SignalChannel, buf: []u8) ![]const u8 {
+        var fbs = std.io.fixedBufferStream(buf);
+        const w = fbs.writer();
+        try w.writeAll(self.http_url);
+        try w.writeAll(SIGNAL_REST_RECEIVE_ENDPOINT);
+        try w.writeAll(self.account);
+        try w.writeAll("?timeout=1");
+        try w.writeAll("&ignore_attachments=");
+        try w.writeAll(if (self.ignore_attachments) "true" else "false");
+        try w.writeAll("&ignore_stories=");
+        try w.writeAll(if (self.ignore_stories) "true" else "false");
+        return fbs.getWritten();
+    }
+
     /// Build the health check URL.
     pub fn healthUrl(self: *const SignalChannel, buf: []u8) ![]const u8 {
         var fbs = std.io.fixedBufferStream(buf);
         const w = fbs.writer();
         try w.writeAll(self.http_url);
-        try w.writeAll(SIGNAL_HEALTH_ENDPOINT);
+        try w.writeAll(if (self.use_rest_api) SIGNAL_REST_HEALTH_ENDPOINT else SIGNAL_HEALTH_ENDPOINT);
         return fbs.getWritten();
     }
 
@@ -282,6 +324,8 @@ pub const SignalChannel = struct {
             }
             break :blk null;
         };
+        // Ignore messages originating from this account to avoid reply loops.
+        if (std.mem.eql(u8, normalizeAllowEntry(sender_raw), normalizeAllowEntry(self.account))) return null;
 
         // Group/DM policy checks.
         if (dm_group_id != null) {
@@ -344,7 +388,9 @@ pub const SignalChannel = struct {
         errdefer allocator.free(reply_target_str);
 
         // Timestamp: prefer data message, then envelope, then current time.
-        const timestamp: u64 = dm_timestamp orelse envelope_timestamp orelse root.nowEpochSecs();
+        // signal-cli commonly reports milliseconds; normalize to seconds.
+        const raw_timestamp: u64 = dm_timestamp orelse envelope_timestamp orelse root.nowEpochSecs();
+        const timestamp = normalizeEpochSeconds(raw_timestamp);
 
         // Build the channel message.
         const msg = root.ChannelMessage{
@@ -484,6 +530,44 @@ pub const SignalChannel = struct {
 
         try body.appendSlice(allocator, "},\"id\":\"1\"}");
 
+        return try body.toOwnedSlice(allocator);
+    }
+
+    /// Build REST JSON body for `/v2/send`.
+    pub fn buildRestBody(
+        self: *const SignalChannel,
+        allocator: std.mem.Allocator,
+        target: RecipientTarget,
+        message: ?[]const u8,
+        attachments_b64: []const []const u8,
+    ) ![]u8 {
+        var body: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer body.deinit(allocator);
+
+        try body.appendSlice(allocator, "{\"number\":");
+        try root.json_util.appendJsonString(&body, allocator, self.account);
+        try body.appendSlice(allocator, ",\"recipients\":[");
+        switch (target) {
+            .direct => |id| try root.json_util.appendJsonString(&body, allocator, id),
+            .group => |gid| try root.json_util.appendJsonString(&body, allocator, gid),
+        }
+        try body.appendSlice(allocator, "]");
+
+        if (message) |msg| {
+            try body.appendSlice(allocator, ",\"message\":");
+            try root.json_util.appendJsonString(&body, allocator, msg);
+        }
+
+        if (attachments_b64.len > 0) {
+            try body.appendSlice(allocator, ",\"base64_attachments\":[");
+            for (attachments_b64, 0..) |att, i| {
+                if (i > 0) try body.appendSlice(allocator, ",");
+                try root.json_util.appendJsonString(&body, allocator, att);
+            }
+            try body.appendSlice(allocator, "]");
+        }
+
+        try body.appendSlice(allocator, "}");
         return try body.toOwnedSlice(allocator);
     }
 
@@ -686,6 +770,45 @@ pub const SignalChannel = struct {
         self.allocator.free(resp);
     }
 
+    fn sendRestPayload(
+        self: *SignalChannel,
+        target: RecipientTarget,
+        message: ?[]const u8,
+        attachments: []const []const u8,
+    ) !void {
+        var b64_attachments: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer {
+            for (b64_attachments.items) |b| self.allocator.free(b);
+            b64_attachments.deinit(self.allocator);
+        }
+
+        for (attachments) |path| {
+            const file_data = fs_compat.readFileAlloc(std.fs.cwd(), self.allocator, path, 10 * 1024 * 1024) catch |err| {
+                log.warn("Signal: failed to read attachment {s}: {}", .{ path, err });
+                continue;
+            };
+            defer self.allocator.free(file_data);
+
+            const encoded_len = std.base64.standard.Encoder.calcSize(file_data.len);
+            const encoded = try self.allocator.alloc(u8, encoded_len);
+            errdefer self.allocator.free(encoded);
+            _ = std.base64.standard.Encoder.encode(encoded, file_data);
+            try b64_attachments.append(self.allocator, encoded);
+        }
+
+        const rest_body = try self.buildRestBody(self.allocator, target, message, b64_attachments.items);
+        defer self.allocator.free(rest_body);
+
+        var url_buf: [1024]u8 = undefined;
+        const url = try self.sendUrl(&url_buf);
+
+        const resp = root.http_util.curlPost(self.allocator, url, rest_body, &.{}) catch |err| {
+            log.warn("Signal REST send failed: {}", .{err});
+            return err;
+        };
+        self.allocator.free(resp);
+    }
+
     /// Send a message via JSON-RPC to the signal-cli daemon.
     /// Parses [IMAGE:path] markers from message text and sends as attachments.
     pub fn sendMessage(self: *SignalChannel, target_str: []const u8, message: []const u8, media: []const []const u8) !void {
@@ -703,13 +826,18 @@ pub const SignalChannel = struct {
                 prepared.attachments[idx .. idx + 1]
             else
                 &.{};
-            try self.sendRpcPayload(target, payload.message, attachments);
+            if (self.use_rest_api) {
+                try self.sendRestPayload(target, payload.message, attachments);
+            } else {
+                try self.sendRpcPayload(target, payload.message, attachments);
+            }
         }
     }
 
     /// Send a typing indicator (best-effort, errors ignored).
     pub fn sendTypingIndicator(self: *SignalChannel, target_str: []const u8) void {
         if (builtin.is_test) return;
+        if (self.use_rest_api) return;
 
         const target = parseRecipientTarget(target_str);
         const rpc_body = self.buildRpcBody(self.allocator, "sendTyping", target, null, &.{}) catch return;
@@ -737,7 +865,7 @@ pub const SignalChannel = struct {
             .target = key_copy,
         };
 
-        task.thread = try std.Thread.spawn(.{ .stack_size = 128 * 1024 }, typingLoop, .{task});
+        task.thread = try std.Thread.spawn(.{ .stack_size = thread_stacks.AUXILIARY_LOOP_STACK_SIZE }, typingLoop, .{task});
         errdefer {
             task.stop_requested.store(true, .release);
             if (task.thread) |t| t.join();
@@ -836,19 +964,99 @@ pub const SignalChannel = struct {
         };
     }
 
-    fn parseSSEEnvelope(self: *const SignalChannel, allocator: std.mem.Allocator, envelope_json: []const u8) !?root.ChannelMessage {
-        const parsed = std.json.parseFromSlice(std.json.Value, allocator, envelope_json, .{}) catch return null;
-        defer parsed.deinit();
+    /// Handle a syncMessage envelope for "Note to Self" support.
+    ///
+    /// Signal sync messages are sent to all linked devices when the primary
+    /// device sends a message. Most syncs are outbound echoes (messages sent
+    /// to other people) and should be ignored. However, when the destination
+    /// of the sentMessage is the account's own number, this is a "Note to Self"
+    /// message — the user is intentionally messaging themselves, and the bot
+    /// (running as a linked device) should process it as an inbound message.
+    fn parseSyncNoteToSelf(
+        self: *const SignalChannel,
+        allocator: std.mem.Allocator,
+        env_obj: std.json.ObjectMap,
+        sync: std.json.Value,
+    ) !?root.ChannelMessage {
+        if (sync != .object) return null;
+        const sent = sync.object.get("sentMessage") orelse return null;
+        if (sent != .object) return null;
+        const sent_obj = sent.object;
 
-        if (parsed.value != .object) return null;
-        const envelope = parsed.value.object.get("envelope") orelse return null;
+        // Check destination: must be self-account for Note to Self.
+        const dest = jsonString(sent_obj.get("destinationNumber")) orelse
+            jsonString(sent_obj.get("destination"));
+        if (dest == null) return null;
+        if (!std.mem.eql(u8, normalizeAllowEntry(dest.?), normalizeAllowEntry(self.account))) return null;
+
+        // Only treat primary-device Note to Self as inbound user intent.
+        // Linked-device sync echoes are outbound reflections and must stay ignored.
+        const source_device = jsonU64(env_obj.get("sourceDevice")) orelse return null;
+        if (source_device != SIGNAL_PRIMARY_DEVICE_ID) return null;
+
+        // Extract message body from sentMessage.
+        const message = jsonString(sent_obj.get("message"));
+        if (message == null or message.?.len == 0) return null;
+
+        // Use the envelope source fields for sender identity.
+        const source = jsonString(env_obj.get("source"));
+        const source_number = jsonString(env_obj.get("sourceNumber"));
+        const source_name = jsonString(env_obj.get("sourceName"));
+        const envelope_timestamp = jsonU64(env_obj.get("timestamp"));
+        const dm_timestamp = jsonU64(sent_obj.get("timestamp"));
+
+        // Effective sender for reply target.
+        const sender_raw = source_number orelse source orelse return null;
+        if (sender_raw.len == 0) return null;
+
+        // Allowlist check: the sender must be in allow_from.
+        if (!(self.isSenderAllowed(sender_raw) or blk: {
+            if (source) |src| {
+                if (!std.mem.eql(u8, src, sender_raw)) break :blk self.isSenderAllowed(src);
+            }
+            break :blk false;
+        })) return null;
+
+        // Build the channel message.
+        const text = try allocator.dupe(u8, message.?);
+        errdefer allocator.free(text);
+        const reply_target_str = try allocator.dupe(u8, sender_raw);
+        errdefer allocator.free(reply_target_str);
+        const raw_timestamp: u64 = dm_timestamp orelse envelope_timestamp orelse root.nowEpochSecs();
+        const timestamp = normalizeEpochSeconds(raw_timestamp);
+
+        return root.ChannelMessage{
+            .id = try allocator.dupe(u8, sender_raw),
+            .sender = try allocator.dupe(u8, sender_raw),
+            .content = text,
+            .channel = "signal",
+            .timestamp = timestamp,
+            .reply_target = reply_target_str,
+            .first_name = if (source_name) |sn| if (sn.len > 0) try allocator.dupe(u8, sn) else null else null,
+            .is_group = false,
+            .sender_uuid = if (source) |src| if (src.len > 0 and isUuid(src)) try allocator.dupe(u8, src) else null else null,
+            .group_id = null,
+        };
+    }
+
+    fn parseEnvelopeValue(self: *const SignalChannel, allocator: std.mem.Allocator, value: std.json.Value) !?root.ChannelMessage {
+        if (value != .object) return null;
+        const envelope = value.object.get("envelope") orelse return null;
         if (envelope != .object) return null;
         const env_obj = envelope.object;
 
-        const source = env_obj.get("source");
-        const source_number = env_obj.get("sourceNumber");
-        const source_name = env_obj.get("sourceName");
-        const timestamp_val = env_obj.get("timestamp");
+        // Handle syncMessage envelopes: only process "Note to Self" messages
+        // where the user sends a message to their own account. All other sync
+        // messages (outbound echoes to other recipients) are dropped.
+        if (env_obj.get("syncMessage")) |sync| {
+            return self.parseSyncNoteToSelf(allocator, env_obj, sync);
+        }
+
+        const source = jsonString(env_obj.get("source"));
+        const source_uuid = jsonString(env_obj.get("sourceUuid"));
+        const source_number = jsonString(env_obj.get("sourceNumber"));
+        const source_name = jsonString(env_obj.get("sourceName"));
+        const timestamp_val = jsonU64(env_obj.get("timestamp"));
 
         var has_story = false;
         var dm_message: ?[]const u8 = null;
@@ -873,8 +1081,18 @@ pub const SignalChannel = struct {
             }
         }
 
-        // Check for data message (regular message)
-        if (env_obj.get("dataMessage")) |dm| {
+        const data_message = blk: {
+            if (env_obj.get("dataMessage")) |dm| break :blk dm;
+            if (env_obj.get("editMessage")) |edit| {
+                if (edit == .object) {
+                    if (edit.object.get("dataMessage")) |dm| break :blk dm;
+                }
+            }
+            break :blk null;
+        };
+
+        // Check for data message (regular message or edited message)
+        if (data_message) |dm| {
             if (dm == .object) {
                 const dm_obj = dm.object;
                 if (dm_obj.get("message")) |msg| {
@@ -906,10 +1124,10 @@ pub const SignalChannel = struct {
 
         return try self.processEnvelope(
             allocator,
-            if (source) |s| if (s == .string) s.string else null else null,
-            if (source_number) |s| if (s == .string) s.string else null else null,
-            if (source_name) |s| if (s == .string) s.string else null else null,
-            if (timestamp_val) |t| if (t == .integer) @intCast(t.integer) else null else null,
+            source_uuid orelse source,
+            source_number,
+            source_name,
+            timestamp_val,
             has_story,
             dm_message,
             dm_timestamp,
@@ -918,11 +1136,68 @@ pub const SignalChannel = struct {
         );
     }
 
+    fn parseSSEEnvelope(self: *const SignalChannel, allocator: std.mem.Allocator, envelope_json: []const u8) !?root.ChannelMessage {
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, envelope_json, .{}) catch return null;
+        defer parsed.deinit();
+        return self.parseEnvelopeValue(allocator, parsed.value);
+    }
+
+    fn appendReceivedEnvelope(
+        self: *SignalChannel,
+        allocator: std.mem.Allocator,
+        messages: *std.ArrayListUnmanaged(root.ChannelMessage),
+        envelope_json: []const u8,
+    ) !void {
+        if (self.parseSSEEnvelope(allocator, envelope_json)) |msg_opt| {
+            if (msg_opt) |msg| {
+                log.debug("Received message from {s} on signal ({d} chars) timestamp={d}", .{ msg.sender, msg.content.len, msg.timestamp });
+                try messages.append(allocator, msg);
+            }
+        } else |_| {}
+    }
+
+    fn pollMessagesRest(self: *SignalChannel, allocator: std.mem.Allocator) ![]root.ChannelMessage {
+        var url_buf: [1200]u8 = undefined;
+        const url = try self.receivePollUrl(&url_buf);
+        const resp = root.http_util.curlGet(self.allocator, url, &.{}, "10") catch |err| {
+            log.warn("Signal REST receive failed: {}", .{err});
+            return &.{};
+        };
+        defer self.allocator.free(resp);
+
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, resp, .{}) catch |err| {
+            log.warn("Signal REST receive parse failed: {}", .{err});
+            return &.{};
+        };
+        defer parsed.deinit();
+        if (parsed.value != .array) return &.{};
+
+        var messages: std.ArrayListUnmanaged(root.ChannelMessage) = .empty;
+        errdefer {
+            for (messages.items) |*msg| msg.deinit(allocator);
+            messages.deinit(allocator);
+        }
+
+        for (parsed.value.array.items) |item| {
+            if (item == .string) {
+                try self.appendReceivedEnvelope(allocator, &messages, item.string);
+            } else if (item == .object) {
+                if (try self.parseEnvelopeValue(allocator, item)) |msg| {
+                    log.debug("Received message from {s} on signal ({d} chars) timestamp={d}", .{ msg.sender, msg.content.len, msg.timestamp });
+                    try messages.append(allocator, msg);
+                }
+            }
+        }
+
+        return try messages.toOwnedSlice(allocator);
+    }
+
     /// Poll for messages using SSE (Server-Sent Events).
     /// Uses persistent streaming HTTP connection for real-time delivery.
     /// Returns a slice of ChannelMessages allocated on the given allocator.
     pub fn pollMessages(self: *SignalChannel, allocator: std.mem.Allocator) ![]root.ChannelMessage {
         if (builtin.is_test) return &.{};
+        if (self.use_rest_api) return self.pollMessagesRest(allocator);
 
         // Initialize SSE connection on first poll.
         // Retry is rate-limited with backoff, but each poll call stays bounded.
@@ -1041,7 +1316,11 @@ pub const SignalChannel = struct {
             return;
         };
         self.allocator.free(resp);
-        log.info("Signal channel started (daemon at {s})", .{self.http_url});
+        if (self.use_rest_api) {
+            log.info("Signal channel started (REST polling at {s})", .{self.http_url});
+        } else {
+            log.info("Signal channel started (daemon at {s})", .{self.http_url});
+        }
     }
 
     fn vtableStop(ptr: *anyopaque) void {
@@ -1099,6 +1378,33 @@ pub const SignalChannel = struct {
         return .{ .ptr = @ptrCast(self), .vtable = &vtable };
     }
 };
+
+fn envFlagEnabled(allocator: std.mem.Allocator, name: []const u8) bool {
+    const value = std.process.getEnvVarOwned(allocator, name) catch return false;
+    defer allocator.free(value);
+    return std.mem.eql(u8, value, "1") or
+        std.ascii.eqlIgnoreCase(value, "true") or
+        std.ascii.eqlIgnoreCase(value, "yes") or
+        std.ascii.eqlIgnoreCase(value, "on");
+}
+
+fn jsonString(value: ?std.json.Value) ?[]const u8 {
+    const v = value orelse return null;
+    return if (v == .string) v.string else null;
+}
+
+fn jsonU64(value: ?std.json.Value) ?u64 {
+    const v = value orelse return null;
+    if (v != .integer) return null;
+    if (v.integer < 0) return null;
+    return @intCast(v.integer);
+}
+
+fn normalizeEpochSeconds(timestamp: u64) u64 {
+    var normalized = timestamp;
+    while (normalized >= 10_000_000_000) normalized /= 1000;
+    return normalized;
+}
 
 // ════════════════════════════════════════════════════════════════════════════
 // Public Helpers
@@ -1595,6 +1901,82 @@ test "health url built correctly" {
     var buf: [1024]u8 = undefined;
     const url = try ch.healthUrl(&buf);
     try std.testing.expectEqualStrings("http://127.0.0.1:8686/api/v1/check", url);
+}
+
+test "rest urls built correctly when enabled" {
+    var ch = SignalChannel.init(
+        std.testing.allocator,
+        "http://127.0.0.1:8686",
+        "+1234567890",
+        &.{},
+        &.{},
+        true,
+        true,
+    );
+    ch.use_rest_api = true;
+
+    var send_buf: [1024]u8 = undefined;
+    const send_url = try ch.sendUrl(&send_buf);
+    try std.testing.expectEqualStrings("http://127.0.0.1:8686/v2/send", send_url);
+
+    var poll_buf: [1200]u8 = undefined;
+    const poll_url = try ch.receivePollUrl(&poll_buf);
+    try std.testing.expectEqualStrings(
+        "http://127.0.0.1:8686/v1/receive/+1234567890?timeout=1&ignore_attachments=true&ignore_stories=true",
+        poll_url,
+    );
+
+    var health_buf: [1024]u8 = undefined;
+    const health_url = try ch.healthUrl(&health_buf);
+    try std.testing.expectEqualStrings("http://127.0.0.1:8686/v1/health", health_url);
+}
+
+test "build rest body direct uses v2 send schema keys" {
+    const ch = SignalChannel.init(
+        std.testing.allocator,
+        "http://127.0.0.1:8686",
+        "+1234567890",
+        &.{},
+        &.{},
+        true,
+        true,
+    );
+    const body = try ch.buildRestBody(
+        std.testing.allocator,
+        .{ .direct = "+5555555555" },
+        "hello",
+        &.{"YWJj"},
+    );
+    defer std.testing.allocator.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"number\":\"+1234567890\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"recipients\":[\"+5555555555\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"base64_attachments\":[\"YWJj\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"recipient\":") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"account\":") == null);
+}
+
+test "build rest body group uses recipients array" {
+    const ch = SignalChannel.init(
+        std.testing.allocator,
+        "http://127.0.0.1:8686",
+        "+1234567890",
+        &.{},
+        &.{},
+        true,
+        true,
+    );
+    const body = try ch.buildRestBody(
+        std.testing.allocator,
+        .{ .group = "abc123" },
+        "hello group",
+        &.{},
+    );
+    defer std.testing.allocator.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"number\":\"+1234567890\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"recipients\":[\"abc123\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"groupId\":") == null);
 }
 
 // ── JSON-RPC Body Tests ─────────────────────────────────────────────
@@ -2663,6 +3045,35 @@ test "process envelope falls back to envelope timestamp" {
     try std.testing.expectEqual(@as(u64, 7777), m.timestamp);
 }
 
+test "process envelope normalizes millisecond timestamps to seconds" {
+    const users = [_][]const u8{"*"};
+    const ch = SignalChannel.init(
+        std.testing.allocator,
+        "http://127.0.0.1:8686",
+        "+1234567890",
+        &users,
+        &.{},
+        true,
+        true,
+    );
+    const msg = try ch.processEnvelope(
+        std.testing.allocator,
+        "+1111111111",
+        "+1111111111",
+        null,
+        1_700_000_000_000, // envelope_timestamp (ms)
+        false,
+        "hi",
+        1_700_000_123_456, // dm_timestamp (ms, preferred)
+        null,
+        &.{},
+    );
+    try std.testing.expect(msg != null);
+    const m = msg.?;
+    defer m.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u64, 1_700_000_123), m.timestamp);
+}
+
 test "process envelope generates timestamp when missing" {
     const users = [_][]const u8{"*"};
     const ch = SignalChannel.init(
@@ -2781,6 +3192,32 @@ test "process envelope sender none when both missing" {
     try std.testing.expect(msg == null);
 }
 
+test "process envelope ignores self messages" {
+    const users = [_][]const u8{"*"};
+    const ch = SignalChannel.init(
+        std.testing.allocator,
+        "http://127.0.0.1:8686",
+        "+1234567890",
+        &users,
+        &.{},
+        true,
+        true,
+    );
+    const msg = try ch.processEnvelope(
+        std.testing.allocator,
+        "+1234567890", // source
+        "+1234567890", // source_number (same as account)
+        null,
+        1000,
+        false,
+        "self ping",
+        1000,
+        null,
+        &.{},
+    );
+    try std.testing.expect(msg == null);
+}
+
 test "parseSSEEnvelope returns owned message content" {
     const users = [_][]const u8{"*"};
     const ch = SignalChannel.init(
@@ -2821,6 +3258,92 @@ test "parseSSEEnvelope returns owned message content" {
 
     try std.testing.expectEqualStrings("hello from sse", msg.content);
     try std.testing.expectEqualStrings("+1111111111", msg.sender);
+}
+
+test "parseSSEEnvelope accepts sourceUuid field" {
+    const uuid = "a1b2c3d4-e5f6-7890-abcd-ef1234567890";
+    const users = [_][]const u8{"uuid:" ++ uuid};
+    const ch = SignalChannel.init(
+        std.testing.allocator,
+        "http://127.0.0.1:8686",
+        "+1234567890",
+        &users,
+        &.{},
+        true,
+        true,
+    );
+    const raw_json = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"envelope\":{{\"sourceUuid\":\"{s}\",\"timestamp\":1700000000000,\"dataMessage\":{{\"message\":\"uuid message\",\"timestamp\":1700000001000}}}}}}",
+        .{uuid},
+    );
+    defer std.testing.allocator.free(raw_json);
+
+    const msg_opt = try ch.parseSSEEnvelope(std.testing.allocator, raw_json);
+    try std.testing.expect(msg_opt != null);
+    const msg = msg_opt.?;
+    defer msg.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(uuid, msg.sender);
+    try std.testing.expect(msg.sender_uuid != null);
+    try std.testing.expectEqualStrings(uuid, msg.sender_uuid.?);
+    try std.testing.expectEqual(@as(u64, 1_700_000_001), msg.timestamp);
+}
+
+test "parseSSEEnvelope ignores syncMessage payloads" {
+    const users = [_][]const u8{"*"};
+    const ch = SignalChannel.init(
+        std.testing.allocator,
+        "http://127.0.0.1:8686",
+        "+1234567890",
+        &users,
+        &.{},
+        true,
+        true,
+    );
+    const raw_json =
+        \\{
+        \\  "envelope": {
+        \\    "sourceNumber": "+1111111111",
+        \\    "syncMessage": {},
+        \\    "dataMessage": { "message": "should skip", "timestamp": 1700000001000 }
+        \\  }
+        \\}
+    ;
+    const msg_opt = try ch.parseSSEEnvelope(std.testing.allocator, raw_json);
+    try std.testing.expect(msg_opt == null);
+}
+
+test "parseSSEEnvelope accepts editMessage dataMessage fallback" {
+    const users = [_][]const u8{"*"};
+    const ch = SignalChannel.init(
+        std.testing.allocator,
+        "http://127.0.0.1:8686",
+        "+1234567890",
+        &users,
+        &.{},
+        true,
+        true,
+    );
+    const raw_json =
+        \\{
+        \\  "envelope": {
+        \\    "sourceNumber": "+1111111111",
+        \\    "timestamp": 1700000000000,
+        \\    "editMessage": {
+        \\      "dataMessage": {
+        \\        "message": "edited hello",
+        \\        "timestamp": 1700000002000
+        \\      }
+        \\    }
+        \\  }
+        \\}
+    ;
+    const msg_opt = try ch.parseSSEEnvelope(std.testing.allocator, raw_json);
+    try std.testing.expect(msg_opt != null);
+    const msg = msg_opt.?;
+    defer msg.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("edited hello", msg.content);
+    try std.testing.expectEqual(@as(u64, 1_700_000_002), msg.timestamp);
 }
 
 test "nextEventBoundary handles lf and crlf delimiters" {
@@ -2913,4 +3436,166 @@ test "stripTrailingSlashes empty string" {
 
 test "stripTrailingSlashes only slashes" {
     try std.testing.expectEqualStrings("", stripTrailingSlashes("///"));
+}
+
+test "parseSSEEnvelope processes Note to Self sync message" {
+    const users = [_][]const u8{"+1234567890"};
+    const ch = SignalChannel.init(
+        std.testing.allocator,
+        "http://127.0.0.1:8686",
+        "+1234567890",
+        &users,
+        &.{},
+        true,
+        true,
+    );
+    const raw_json =
+        \\{
+        \\  "envelope": {
+        \\    "source": "+1234567890",
+        \\    "sourceNumber": "+1234567890",
+        \\    "sourceDevice": 1,
+        \\    "sourceName": "Test User",
+        \\    "timestamp": 1700000000000,
+        \\    "syncMessage": {
+        \\      "sentMessage": {
+        \\        "destination": "+1234567890",
+        \\        "destinationNumber": "+1234567890",
+        \\        "message": "hello from note to self",
+        \\        "timestamp": 1700000001000
+        \\      }
+        \\    }
+        \\  }
+        \\}
+    ;
+    const msg_opt = try ch.parseSSEEnvelope(std.testing.allocator, raw_json);
+    try std.testing.expect(msg_opt != null);
+    const msg = msg_opt.?;
+    defer msg.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("hello from note to self", msg.content);
+    try std.testing.expectEqualStrings("+1234567890", msg.sender);
+    try std.testing.expectEqualStrings("Test User", msg.first_name.?);
+    try std.testing.expectEqual(@as(u64, 1_700_000_001), msg.timestamp);
+}
+
+test "parseSSEEnvelope ignores sync outbound to other recipient" {
+    const users = [_][]const u8{"*"};
+    const ch = SignalChannel.init(
+        std.testing.allocator,
+        "http://127.0.0.1:8686",
+        "+1234567890",
+        &users,
+        &.{},
+        true,
+        true,
+    );
+    const raw_json =
+        \\{
+        \\  "envelope": {
+        \\    "sourceNumber": "+1234567890",
+        \\    "sourceDevice": 1,
+        \\    "timestamp": 1700000000000,
+        \\    "syncMessage": {
+        \\      "sentMessage": {
+        \\        "destination": "+9999999999",
+        \\        "destinationNumber": "+9999999999",
+        \\        "message": "outbound echo should be dropped",
+        \\        "timestamp": 1700000001000
+        \\      }
+        \\    }
+        \\  }
+        \\}
+    ;
+    const msg_opt = try ch.parseSSEEnvelope(std.testing.allocator, raw_json);
+    try std.testing.expect(msg_opt == null);
+}
+
+test "parseSSEEnvelope ignores Note to Self from non-allowed sender" {
+    const users = [_][]const u8{"+9999999999"};
+    const ch = SignalChannel.init(
+        std.testing.allocator,
+        "http://127.0.0.1:8686",
+        "+1234567890",
+        &users,
+        &.{},
+        true,
+        true,
+    );
+    const raw_json =
+        \\{
+        \\  "envelope": {
+        \\    "sourceNumber": "+1234567890",
+        \\    "sourceDevice": 1,
+        \\    "timestamp": 1700000000000,
+        \\    "syncMessage": {
+        \\      "sentMessage": {
+        \\        "destinationNumber": "+1234567890",
+        \\        "message": "note to self but not allowed",
+        \\        "timestamp": 1700000001000
+        \\      }
+        \\    }
+        \\  }
+        \\}
+    ;
+    const msg_opt = try ch.parseSSEEnvelope(std.testing.allocator, raw_json);
+    try std.testing.expect(msg_opt == null);
+}
+
+test "parseSSEEnvelope ignores sync with empty sentMessage" {
+    const users = [_][]const u8{"*"};
+    const ch = SignalChannel.init(
+        std.testing.allocator,
+        "http://127.0.0.1:8686",
+        "+1234567890",
+        &users,
+        &.{},
+        true,
+        true,
+    );
+    const raw_json =
+        \\{
+        \\  "envelope": {
+        \\    "sourceNumber": "+1234567890",
+        \\    "sourceDevice": 1,
+        \\    "syncMessage": {
+        \\      "sentMessage": {
+        \\        "destinationNumber": "+1234567890"
+        \\      }
+        \\    }
+        \\  }
+        \\}
+    ;
+    const msg_opt = try ch.parseSSEEnvelope(std.testing.allocator, raw_json);
+    try std.testing.expect(msg_opt == null);
+}
+
+test "parseSSEEnvelope ignores Note to Self sync from linked device" {
+    const users = [_][]const u8{"+1234567890"};
+    const ch = SignalChannel.init(
+        std.testing.allocator,
+        "http://127.0.0.1:8686",
+        "+1234567890",
+        &users,
+        &.{},
+        true,
+        true,
+    );
+    const raw_json =
+        \\{
+        \\  "envelope": {
+        \\    "sourceNumber": "+1234567890",
+        \\    "sourceDevice": 3,
+        \\    "timestamp": 1700000000000,
+        \\    "syncMessage": {
+        \\      "sentMessage": {
+        \\        "destinationNumber": "+1234567890",
+        \\        "message": "linked device echo should be dropped",
+        \\        "timestamp": 1700000001000
+        \\      }
+        \\    }
+        \\  }
+        \\}
+    ;
+    const msg_opt = try ch.parseSSEEnvelope(std.testing.allocator, raw_json);
+    try std.testing.expect(msg_opt == null);
 }

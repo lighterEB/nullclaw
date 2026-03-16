@@ -39,6 +39,8 @@ pub fn extractHost(url: []const u8) ?[]const u8 {
 pub fn hostMatchesAllowlist(host: []const u8, allowed: []const []const u8) bool {
     if (allowed.len == 0) return true; // empty allowlist = allow all
     for (allowed) |pattern| {
+        // Global wildcard: "*" matches any host
+        if (std.mem.eql(u8, pattern, "*")) return true;
         // Exact match
         if (std.mem.eql(u8, host, pattern)) return true;
         // Wildcard subdomain: "*.example.com" matches "api.example.com"
@@ -47,13 +49,6 @@ pub fn hostMatchesAllowlist(host: []const u8, allowed: []const []const u8) bool 
             if (std.mem.endsWith(u8, host, domain)) {
                 const prefix_len = host.len - domain.len;
                 if (prefix_len > 0 and host[prefix_len - 1] == '.') return true;
-            }
-        }
-        // Also allow implicit subdomain match (like browser_open does)
-        if (host.len > pattern.len) {
-            const offset = host.len - pattern.len;
-            if (std.mem.eql(u8, host[offset..], pattern) and host[offset - 1] == '.') {
-                return true;
             }
         }
     }
@@ -260,7 +255,7 @@ pub fn hostResolvesToLocal(allocator: std.mem.Allocator, host: []const u8, port:
     return false;
 }
 
-fn stripHostBrackets(host: []const u8) []const u8 {
+pub fn stripHostBrackets(host: []const u8) []const u8 {
     if (std.mem.startsWith(u8, host, "[") and std.mem.endsWith(u8, host, "]")) {
         return host[1 .. host.len - 1];
     }
@@ -540,6 +535,11 @@ test "extractHost handles query and fragment" {
     try std.testing.expectEqualStrings("example.com", extractHost("https://example.com/path?q=1#frag").?);
 }
 
+test "stripHostBrackets removes surrounding brackets only" {
+    try std.testing.expectEqualStrings("::1", stripHostBrackets("[::1]"));
+    try std.testing.expectEqualStrings("example.com", stripHostBrackets("example.com"));
+}
+
 test "isLocalHost detects localhost" {
     try std.testing.expect(isLocalHost("localhost"));
     try std.testing.expect(isLocalHost("foo.localhost"));
@@ -702,9 +702,9 @@ test "hostMatchesAllowlist empty allowlist allows all" {
     try std.testing.expect(hostMatchesAllowlist("anything.com", empty));
 }
 
-test "hostMatchesAllowlist implicit subdomain match" {
+test "hostMatchesAllowlist exact entry does not implicitly match subdomains" {
     const domains = [_][]const u8{"example.com"};
-    try std.testing.expect(hostMatchesAllowlist("api.example.com", &domains));
+    try std.testing.expect(!hostMatchesAllowlist("api.example.com", &domains));
     try std.testing.expect(!hostMatchesAllowlist("notexample.com", &domains));
 }
 

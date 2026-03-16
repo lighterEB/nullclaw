@@ -2,8 +2,11 @@ const std = @import("std");
 const builtin = @import("builtin");
 const root = @import("root.zig");
 const config_types = @import("../config_types.zig");
+const interaction_choices = @import("../interactions/choices.zig");
 const bus_mod = @import("../bus.zig");
 const websocket = @import("../websocket.zig");
+
+const Atomic = @import("../portable_atomic.zig").Atomic;
 
 const log = std.log.scoped(.slack);
 
@@ -12,6 +15,72 @@ const invalid_socket: SocketFd = switch (builtin.os.tag) {
     .windows => std.os.windows.ws2_32.INVALID_SOCKET,
     else => -1,
 };
+
+const CALLBACK_VALUE_PREFIX = "ncslack:";
+const DEFAULT_INTERACTION_TTL_SECS: u64 = 900;
+
+const PendingInteractionOption = struct {
+    id: []const u8,
+    label: []const u8,
+    submit_text: []const u8,
+
+    fn deinit(self: *const PendingInteractionOption, allocator: std.mem.Allocator) void {
+        allocator.free(self.id);
+        allocator.free(self.label);
+        allocator.free(self.submit_text);
+    }
+};
+
+const PendingInteraction = struct {
+    allocator: std.mem.Allocator,
+    created_at: u64,
+    expires_at: u64,
+    account_id: []const u8,
+    target: []const u8,
+    owner_identity: ?[]const u8 = null,
+    options: []PendingInteractionOption,
+
+    fn deinit(self: *const PendingInteraction) void {
+        self.allocator.free(self.account_id);
+        self.allocator.free(self.target);
+        if (self.owner_identity) |owner| self.allocator.free(owner);
+        for (self.options) |opt| opt.deinit(self.allocator);
+        self.allocator.free(self.options);
+    }
+};
+
+pub const CallbackSelection = union(enum) {
+    ok: struct {
+        submit_text: []u8,
+        target: []u8,
+    },
+    not_found,
+    expired,
+    owner_mismatch,
+    invalid_option,
+};
+
+var shared_interactions_mu: std.Thread.Mutex = .{};
+var shared_interactions: std.StringHashMapUnmanaged(PendingInteraction) = .empty;
+var shared_interaction_seq: Atomic(u64) = Atomic(u64).init(1);
+
+fn sharedInteractionsAllocator() std.mem.Allocator {
+    return if (builtin.is_test) std.testing.allocator else std.heap.page_allocator;
+}
+
+fn validateChoices(choices: []const root.Channel.OutboundChoice) bool {
+    if (choices.len < interaction_choices.MIN_OPTIONS or choices.len > interaction_choices.MAX_OPTIONS) {
+        return false;
+    }
+
+    for (choices) |choice| {
+        if (choice.id.len == 0 or choice.id.len > interaction_choices.MAX_ID_LEN) return false;
+        if (choice.label.len == 0 or choice.label.len > interaction_choices.MAX_LABEL_LEN) return false;
+        if (choice.submit_text.len == 0 or choice.submit_text.len > interaction_choices.MAX_SUBMIT_TEXT_LEN) return false;
+    }
+
+    return true;
+}
 
 /// Slack channel — socket/http event pipeline for inbound, chat.postMessage for outbound.
 pub const SlackChannel = struct {
@@ -28,6 +97,7 @@ pub const SlackChannel = struct {
     last_ts_owned: bool = false,
     last_ts_by_channel: std.StringHashMapUnmanaged([]u8) = .empty,
     thread_ts: ?[]const u8 = null,
+    reply_to_mode: config_types.SlackReplyToMode = .off,
     policy: root.ChannelPolicy = .{},
     bus: ?*bus_mod.Bus = null,
     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -37,17 +107,17 @@ pub const SlackChannel = struct {
     socket_thread: ?std.Thread = null,
     ws_fd: std.atomic.Value(SocketFd) = std.atomic.Value(SocketFd).init(invalid_socket),
     bot_user_id: ?[]u8 = null,
+    bot_team_id: ?[]u8 = null,
+    bot_api_app_id: ?[]u8 = null,
 
     pub const API_BASE = "https://slack.com/api";
     pub const DEFAULT_WEBHOOK_PATH = "/slack/events";
     pub const RECONNECT_DELAY_NS: u64 = 5 * std.time.ns_per_s;
     pub const POLL_INTERVAL_SECS: u64 = 3;
-    pub const POLL_THREAD_STACK_SIZE: usize = 256 * 1024;
-    pub const SOCKET_THREAD_STACK_SIZE: usize = switch (builtin.cpu.arch) {
-        .aarch64, .arm => 1024 * 1024,
-        else => 256 * 1024,
-    };
+    pub const POLL_THREAD_STACK_SIZE: usize = 2 * 1024 * 1024;
+    pub const SOCKET_THREAD_STACK_SIZE: usize = 2 * 1024 * 1024;
     pub const SOCKET_FAILURE_FALLBACK_THRESHOLD: u32 = 3;
+    pub const TOKEN_TRIM_CHARS = " \t\r\n";
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -123,6 +193,7 @@ pub const SlackChannel = struct {
         ch.mode = cfg.mode;
         ch.signing_secret = cfg.signing_secret;
         ch.webhook_path = normalizeWebhookPath(cfg.webhook_path);
+        ch.reply_to_mode = cfg.reply_to_mode;
         return ch;
     }
 
@@ -228,13 +299,173 @@ pub const SlackChannel = struct {
         return std.fmt.parseFloat(f64, ts) catch 0.0;
     }
 
+    const SlackApiErrorInfo = struct {
+        code: []const u8,
+        needed: ?[]const u8 = null,
+        provided: ?[]const u8 = null,
+    };
+
+    fn slackApiErrorInfo(obj: std.json.ObjectMap) ?SlackApiErrorInfo {
+        const err_val = obj.get("error") orelse return null;
+        if (err_val != .string or err_val.string.len == 0) return null;
+
+        var info = SlackApiErrorInfo{
+            .code = err_val.string,
+        };
+        if (obj.get("needed")) |needed_val| {
+            if (needed_val == .string and needed_val.string.len > 0) info.needed = needed_val.string;
+        }
+        if (obj.get("provided")) |provided_val| {
+            if (provided_val == .string and provided_val.string.len > 0) info.provided = provided_val.string;
+        }
+        return info;
+    }
+
+    fn isAuthFailureCode(code: []const u8) bool {
+        return std.mem.eql(u8, code, "invalid_auth") or
+            std.mem.eql(u8, code, "not_authed") or
+            std.mem.eql(u8, code, "account_inactive") or
+            std.mem.eql(u8, code, "token_revoked") or
+            std.mem.eql(u8, code, "missing_scope") or
+            std.mem.eql(u8, code, "not_allowed_token_type") or
+            std.mem.eql(u8, code, "no_permission");
+    }
+
+    fn logSlackApiError(endpoint: []const u8, context: ?[]const u8, info: SlackApiErrorInfo) void {
+        if (context) |ctx| {
+            if (info.needed) |needed| {
+                if (info.provided) |provided| {
+                    log.warn("Slack {s} API error ({s}): {s} (needed={s}, provided={s})", .{ endpoint, ctx, info.code, needed, provided });
+                } else {
+                    log.warn("Slack {s} API error ({s}): {s} (needed={s})", .{ endpoint, ctx, info.code, needed });
+                }
+            } else {
+                log.warn("Slack {s} API error ({s}): {s}", .{ endpoint, ctx, info.code });
+            }
+            return;
+        }
+
+        if (info.needed) |needed| {
+            if (info.provided) |provided| {
+                log.warn("Slack {s} API error: {s} (needed={s}, provided={s})", .{ endpoint, info.code, needed, provided });
+            } else {
+                log.warn("Slack {s} API error: {s} (needed={s})", .{ endpoint, info.code, needed });
+            }
+        } else {
+            log.warn("Slack {s} API error: {s}", .{ endpoint, info.code });
+        }
+    }
+
+    fn ensureSlackApiOk(obj: std.json.ObjectMap, endpoint: []const u8, context: ?[]const u8) !void {
+        const ok_val = obj.get("ok") orelse return error.SlackApiError;
+        if (ok_val == .bool and ok_val.bool) return;
+
+        if (slackApiErrorInfo(obj)) |info| {
+            logSlackApiError(endpoint, context, info);
+            if (isAuthFailureCode(info.code)) return error.SlackAuthFailed;
+        }
+        return error.SlackApiError;
+    }
+
+    fn hasValidBotToken(self: *const SlackChannel) bool {
+        return self.normalizedBotToken().len > 0;
+    }
+
     fn isDirectConversationId(channel_id: []const u8) bool {
         return channel_id.len > 0 and channel_id[0] == 'D';
     }
 
+    fn normalizedBotToken(self: *const SlackChannel) []const u8 {
+        return std.mem.trim(u8, self.bot_token, TOKEN_TRIM_CHARS);
+    }
+
+    fn normalizedAppToken(self: *const SlackChannel) ?[]const u8 {
+        const app_token = self.app_token orelse return null;
+        const trimmed = std.mem.trim(u8, app_token, TOKEN_TRIM_CHARS);
+        if (trimmed.len == 0) return null;
+        return trimmed;
+    }
+
+    fn parseApiAppIdFromAppToken(raw: []const u8) ?[]const u8 {
+        const token = std.mem.trim(u8, raw, TOKEN_TRIM_CHARS);
+        if (token.len == 0) return null;
+
+        var parts = std.mem.splitScalar(u8, token, '-');
+        const prefix = parts.next() orelse return null;
+        if (!std.ascii.eqlIgnoreCase(prefix, "xapp")) return null;
+
+        const version = parts.next() orelse return null;
+        if (version.len == 0) return null;
+        for (version) |ch| {
+            if (!std.ascii.isDigit(ch)) return null;
+        }
+
+        const api_app_id = parts.next() orelse return null;
+        if (api_app_id.len == 0) return null;
+        for (api_app_id) |ch| {
+            if (!std.ascii.isAlphanumeric(ch)) return null;
+        }
+        const remainder = parts.next() orelse return null;
+        if (remainder.len == 0) return null;
+        return api_app_id;
+    }
+
+    fn ensureSocketTokenPairMatches(self: *const SlackChannel) !void {
+        if (self.mode != .socket) return;
+        const app_token = self.normalizedAppToken() orelse return;
+        const bot_api_app_id = self.bot_api_app_id orelse return;
+        const expected_api_app_id = parseApiAppIdFromAppToken(app_token) orelse return;
+        if (std.ascii.eqlIgnoreCase(bot_api_app_id, expected_api_app_id)) return;
+
+        const mismatch_fmt = "Slack token mismatch: bot_token api_app_id={s} but app_token api_app_id={s}";
+        if (builtin.is_test) {
+            log.warn(mismatch_fmt, .{ bot_api_app_id, expected_api_app_id });
+        } else {
+            log.err(mismatch_fmt, .{ bot_api_app_id, expected_api_app_id });
+        }
+        return error.SlackAuthFailed;
+    }
+
+    fn shouldDropMismatchedSocketEvent(self: *const SlackChannel, payload_obj: std.json.ObjectMap) bool {
+        const incoming_api_app_id = if (payload_obj.get("api_app_id")) |api_app_id_val|
+            if (api_app_id_val == .string and api_app_id_val.string.len > 0) api_app_id_val.string else null
+        else
+            null;
+        const incoming_team_id = if (payload_obj.get("team_id")) |team_id_val|
+            if (team_id_val == .string and team_id_val.string.len > 0) team_id_val.string else null
+        else
+            null;
+
+        if (self.bot_api_app_id) |expected_api_app_id| {
+            if (incoming_api_app_id) |actual_api_app_id| {
+                if (!std.ascii.eqlIgnoreCase(expected_api_app_id, actual_api_app_id)) {
+                    log.warn(
+                        "Slack socket event dropped: api_app_id={s} expected={s}",
+                        .{ actual_api_app_id, expected_api_app_id },
+                    );
+                    return true;
+                }
+            }
+        }
+
+        if (self.bot_team_id) |expected_team_id| {
+            if (incoming_team_id) |actual_team_id| {
+                if (!std.mem.eql(u8, expected_team_id, actual_team_id)) {
+                    log.warn(
+                        "Slack socket event dropped: team_id={s} expected={s}",
+                        .{ actual_team_id, expected_team_id },
+                    );
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
     fn fetchBotUserId(self: *SlackChannel) !void {
         const url = API_BASE ++ "/auth.test";
-        const auth_header = try std.fmt.allocPrint(self.allocator, "Authorization: Bearer {s}", .{self.bot_token});
+        const auth_header = try std.fmt.allocPrint(self.allocator, "Authorization: Bearer {s}", .{self.normalizedBotToken()});
         defer self.allocator.free(auth_header);
         const headers = [_][]const u8{auth_header};
         const resp = root.http_util.curlGet(self.allocator, url, &headers, "15") catch return error.SlackApiError;
@@ -243,13 +474,24 @@ pub const SlackChannel = struct {
         const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, resp, .{}) catch return error.SlackApiError;
         defer parsed.deinit();
         if (parsed.value != .object) return error.SlackApiError;
-        const ok_val = parsed.value.object.get("ok") orelse return error.SlackApiError;
-        if (ok_val != .bool or !ok_val.bool) return error.SlackApiError;
+        try ensureSlackApiOk(parsed.value.object, "auth.test", null);
         const uid_val = parsed.value.object.get("user_id") orelse return error.SlackApiError;
         if (uid_val != .string or uid_val.string.len == 0) return error.SlackApiError;
+        const team_id = if (parsed.value.object.get("team_id")) |team_id_val|
+            if (team_id_val == .string and team_id_val.string.len > 0) team_id_val.string else null
+        else
+            null;
+        const api_app_id = if (parsed.value.object.get("api_app_id")) |api_app_id_val|
+            if (api_app_id_val == .string and api_app_id_val.string.len > 0) api_app_id_val.string else null
+        else
+            null;
 
         if (self.bot_user_id) |old| self.allocator.free(old);
         self.bot_user_id = try self.allocator.dupe(u8, uid_val.string);
+        if (self.bot_team_id) |old| self.allocator.free(old);
+        self.bot_team_id = if (team_id) |value| try self.allocator.dupe(u8, value) else null;
+        if (self.bot_api_app_id) |old| self.allocator.free(old);
+        self.bot_api_app_id = if (api_app_id) |value| try self.allocator.dupe(u8, value) else null;
     }
 
     fn processHistoryMessage(
@@ -284,6 +526,25 @@ pub const SlackChannel = struct {
         const is_dm = isDirectConversationId(channel_id);
         if (!self.shouldHandle(sender_id, is_dm, text, self.bot_user_id)) return;
 
+        // Determine effective thread_ts for the reply target.
+        // A message with thread_ts == ts is a top-level post that merely started a
+        // thread; only thread_ts != ts means it is an actual thread reply.
+        const is_thread_reply = if (thread_ts) |tts|
+            if (message_ts) |mts| !std.mem.eql(u8, tts, mts) else true
+        else
+            false;
+        const effective_thread_ts: ?[]const u8 = switch (self.reply_to_mode) {
+            .off => if (is_thread_reply) thread_ts else null,
+            .all => thread_ts orelse message_ts,
+        };
+
+        // Build chat_id: "channel_id:thread_ts" for threaded replies, plain channel_id otherwise.
+        const chat_id = if (effective_thread_ts) |tts|
+            try std.fmt.allocPrint(self.allocator, "{s}:{s}", .{ channel_id, tts })
+        else
+            channel_id;
+        defer if (effective_thread_ts != null) self.allocator.free(chat_id);
+
         const session_key = if (is_dm)
             try std.fmt.allocPrint(self.allocator, "slack:{s}:direct:{s}", .{ self.account_id, sender_id })
         else
@@ -314,7 +575,7 @@ pub const SlackChannel = struct {
             self.allocator,
             "slack",
             sender_id,
-            channel_id,
+            chat_id,
             text,
             session_key,
             &.{},
@@ -338,7 +599,7 @@ pub const SlackChannel = struct {
         try w.print("{s}/conversations.history?channel={s}&oldest={s}&inclusive=false&limit=100", .{ API_BASE, channel_id, oldest });
         const url = fbs.getWritten();
 
-        const auth_header = try std.fmt.allocPrint(self.allocator, "Authorization: Bearer {s}", .{self.bot_token});
+        const auth_header = try std.fmt.allocPrint(self.allocator, "Authorization: Bearer {s}", .{self.normalizedBotToken()});
         defer self.allocator.free(auth_header);
         const headers = [_][]const u8{auth_header};
         const resp = root.http_util.curlGet(self.allocator, url, &headers, "30") catch return error.SlackApiError;
@@ -347,9 +608,7 @@ pub const SlackChannel = struct {
         const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, resp, .{}) catch return error.SlackApiError;
         defer parsed.deinit();
         if (parsed.value != .object) return error.SlackApiError;
-
-        const ok_val = parsed.value.object.get("ok") orelse return error.SlackApiError;
-        if (ok_val != .bool or !ok_val.bool) return error.SlackApiError;
+        try ensureSlackApiOk(parsed.value.object, "conversations.history", channel_id);
 
         const messages_val = parsed.value.object.get("messages") orelse return;
         if (messages_val != .array) return;
@@ -399,6 +658,12 @@ pub const SlackChannel = struct {
     fn pollLoop(self: *SlackChannel) void {
         while (self.running.load(.acquire)) {
             self.pollOnce() catch |err| {
+                if (err == error.SlackAuthFailed) {
+                    log.err("Slack polling auth failed; stopping Slack channel. Verify bot_token and scopes.", .{});
+                    self.running.store(false, .release);
+                    self.connected.store(false, .release);
+                    return;
+                }
                 log.warn("Slack poll error: {}", .{err});
             };
 
@@ -410,8 +675,7 @@ pub const SlackChannel = struct {
     }
 
     fn hasValidAppToken(self: *const SlackChannel) bool {
-        const app_token = self.app_token orelse return false;
-        return std.mem.trim(u8, app_token, " \t\r\n").len > 0;
+        return self.normalizedAppToken() != null;
     }
 
     fn hasPollingTargets(self: *const SlackChannel) bool {
@@ -497,7 +761,7 @@ pub const SlackChannel = struct {
     }
 
     fn openSocketUrl(self: *SlackChannel) ![]u8 {
-        const app_token = self.app_token orelse return error.SlackAppTokenRequired;
+        const app_token = self.normalizedAppToken() orelse return error.SlackAppTokenRequired;
         const url = API_BASE ++ "/apps.connections.open";
         const auth_header = try std.fmt.allocPrint(self.allocator, "Authorization: Bearer {s}", .{app_token});
         defer self.allocator.free(auth_header);
@@ -508,8 +772,7 @@ pub const SlackChannel = struct {
         const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, resp, .{}) catch return error.SlackApiError;
         defer parsed.deinit();
         if (parsed.value != .object) return error.SlackApiError;
-        const ok_val = parsed.value.object.get("ok") orelse return error.SlackApiError;
-        if (ok_val != .bool or !ok_val.bool) return error.SlackApiError;
+        try ensureSlackApiOk(parsed.value.object, "apps.connections.open", null);
         const ws_url = parsed.value.object.get("url") orelse return error.SlackApiError;
         if (ws_url != .string or ws_url.string.len == 0) return error.SlackApiError;
         return self.allocator.dupe(u8, ws_url.string);
@@ -550,6 +813,7 @@ pub const SlackChannel = struct {
 
         const payload_val = parsed.value.object.get("payload") orelse return;
         if (payload_val != .object) return;
+        if (self.shouldDropMismatchedSocketEvent(payload_val.object)) return;
         const event_val = payload_val.object.get("event") orelse return;
         if (event_val != .object) return;
 
@@ -601,6 +865,12 @@ pub const SlackChannel = struct {
             if (self.runSocketOnce()) |_| {
                 consecutive_socket_failures = 0;
             } else |err| {
+                if (err == error.SlackAuthFailed) {
+                    log.err("Slack socket auth failed; stopping Slack channel. Verify bot_token/app_token and scopes.", .{});
+                    self.running.store(false, .release);
+                    self.connected.store(false, .release);
+                    return;
+                }
                 if (shouldCountSocketFailure(err)) {
                     if (err != error.SlackAppTokenRequired) {
                         log.warn("Slack socket cycle failed: {}", .{err});
@@ -629,6 +899,214 @@ pub const SlackChannel = struct {
 
     // ── Channel vtable ──────────────────────────────────────────────
 
+    fn appendPostMessageBody(
+        self: *SlackChannel,
+        body_list: *std.ArrayListUnmanaged(u8),
+        actual_channel: []const u8,
+        text: []const u8,
+    ) !void {
+        const mrkdwn_text = try markdownToSlackMrkdwn(self.allocator, text);
+        defer self.allocator.free(mrkdwn_text);
+
+        try body_list.appendSlice(self.allocator, "{\"channel\":\"");
+        try body_list.appendSlice(self.allocator, actual_channel);
+        try body_list.appendSlice(self.allocator, "\",\"mrkdwn\":true,\"text\":");
+        try root.json_util.appendJsonString(body_list, self.allocator, mrkdwn_text);
+        if (self.thread_ts) |tts| {
+            try body_list.appendSlice(self.allocator, ",\"thread_ts\":\"");
+            try body_list.appendSlice(self.allocator, tts);
+            try body_list.append(self.allocator, '"');
+        }
+        try body_list.append(self.allocator, '}');
+    }
+
+    fn nextInteractionToken(self: *const SlackChannel) ![]u8 {
+        var token_buf: [32]u8 = undefined;
+        const seq = shared_interaction_seq.fetchAdd(1, .monotonic);
+        const token = std.fmt.bufPrint(&token_buf, "{x}", .{seq}) catch unreachable;
+        return self.allocator.dupe(u8, token);
+    }
+
+    fn registerPendingInteraction(
+        self: *SlackChannel,
+        token: []const u8,
+        target: []const u8,
+        owner_identity: ?[]const u8,
+        choices: []const root.Channel.OutboundChoice,
+    ) !void {
+        const interaction_allocator = sharedInteractionsAllocator();
+        const now = root.nowEpochSecs();
+
+        var options = try interaction_allocator.alloc(PendingInteractionOption, choices.len);
+        var built: usize = 0;
+        errdefer {
+            for (options[0..built]) |opt| opt.deinit(interaction_allocator);
+            interaction_allocator.free(options);
+        }
+
+        for (choices, 0..) |choice, i| {
+            options[i] = .{
+                .id = try interaction_allocator.dupe(u8, choice.id),
+                .label = try interaction_allocator.dupe(u8, choice.label),
+                .submit_text = try interaction_allocator.dupe(u8, choice.submit_text),
+            };
+            built += 1;
+        }
+
+        const key = try interaction_allocator.dupe(u8, token);
+        errdefer interaction_allocator.free(key);
+        const target_dup = try interaction_allocator.dupe(u8, target);
+        errdefer interaction_allocator.free(target_dup);
+        const account_id_dup = try interaction_allocator.dupe(u8, self.account_id);
+        errdefer interaction_allocator.free(account_id_dup);
+        const owner_dup = if (owner_identity) |owner|
+            try interaction_allocator.dupe(u8, owner)
+        else
+            null;
+        errdefer if (owner_dup) |owner| interaction_allocator.free(owner);
+
+        shared_interactions_mu.lock();
+        defer shared_interactions_mu.unlock();
+
+        self.expireInteractionsLocked(now);
+
+        try shared_interactions.put(interaction_allocator, key, .{
+            .allocator = interaction_allocator,
+            .created_at = now,
+            .expires_at = now + DEFAULT_INTERACTION_TTL_SECS,
+            .account_id = account_id_dup,
+            .target = target_dup,
+            .owner_identity = owner_dup,
+            .options = options,
+        });
+    }
+
+    fn expireInteractionsLocked(self: *SlackChannel, now: u64) void {
+        _ = self;
+        while (true) {
+            var expired_key: ?[]const u8 = null;
+            var it = shared_interactions.iterator();
+            while (it.next()) |entry| {
+                if (entry.value_ptr.expires_at < now) {
+                    expired_key = entry.key_ptr.*;
+                    break;
+                }
+            }
+
+            const key = expired_key orelse break;
+            if (shared_interactions.fetchRemove(key)) |removed| {
+                removed.value.deinit();
+                removed.value.allocator.free(@constCast(removed.key));
+            }
+        }
+
+        if (shared_interactions.count() == 0) {
+            shared_interactions.deinit(sharedInteractionsAllocator());
+            shared_interactions = .empty;
+        }
+    }
+
+    pub fn consumeInteractionSelection(
+        self: *SlackChannel,
+        token: []const u8,
+        option_index: usize,
+        sender_identity: []const u8,
+    ) CallbackSelection {
+        shared_interactions_mu.lock();
+        defer shared_interactions_mu.unlock();
+
+        const now = root.nowEpochSecs();
+        self.expireInteractionsLocked(now);
+
+        const interaction = shared_interactions.getPtr(token) orelse return .not_found;
+        if (!std.ascii.eqlIgnoreCase(interaction.account_id, self.account_id)) return .not_found;
+        if (interaction.owner_identity) |owner| {
+            if (!std.ascii.eqlIgnoreCase(owner, sender_identity)) return .owner_mismatch;
+        }
+        if (option_index >= interaction.options.len) return .invalid_option;
+
+        const submit_text = self.allocator.dupe(u8, interaction.options[option_index].submit_text) catch return .invalid_option;
+        errdefer self.allocator.free(submit_text);
+        const target = self.allocator.dupe(u8, interaction.target) catch return .invalid_option;
+        errdefer self.allocator.free(target);
+
+        if (shared_interactions.fetchRemove(token)) |removed| {
+            removed.value.deinit();
+            removed.value.allocator.free(@constCast(removed.key));
+        }
+
+        return .{ .ok = .{
+            .submit_text = submit_text,
+            .target = target,
+        } };
+    }
+
+    fn deinitPendingInteractions(self: *SlackChannel) void {
+        shared_interactions_mu.lock();
+        defer shared_interactions_mu.unlock();
+
+        while (true) {
+            var matching_key: ?[]const u8 = null;
+            var it = shared_interactions.iterator();
+            while (it.next()) |entry| {
+                if (std.ascii.eqlIgnoreCase(entry.value_ptr.account_id, self.account_id)) {
+                    matching_key = entry.key_ptr.*;
+                    break;
+                }
+            }
+
+            const key = matching_key orelse break;
+            if (shared_interactions.fetchRemove(key)) |removed| {
+                removed.value.deinit();
+                removed.value.allocator.free(@constCast(removed.key));
+            }
+        }
+
+        if (shared_interactions.count() == 0) {
+            shared_interactions.deinit(sharedInteractionsAllocator());
+            shared_interactions = .empty;
+        }
+    }
+
+    fn appendInteractivePostMessageBody(
+        self: *SlackChannel,
+        body_list: *std.ArrayListUnmanaged(u8),
+        actual_channel: []const u8,
+        text: []const u8,
+        token: []const u8,
+        choices: []const root.Channel.OutboundChoice,
+    ) !void {
+        const mrkdwn_text = try markdownToSlackMrkdwn(self.allocator, text);
+        defer self.allocator.free(mrkdwn_text);
+
+        try body_list.appendSlice(self.allocator, "{\"channel\":\"");
+        try body_list.appendSlice(self.allocator, actual_channel);
+        try body_list.appendSlice(self.allocator, "\",\"mrkdwn\":true,\"text\":");
+        try root.json_util.appendJsonString(body_list, self.allocator, mrkdwn_text);
+        if (self.thread_ts) |tts| {
+            try body_list.appendSlice(self.allocator, ",\"thread_ts\":\"");
+            try body_list.appendSlice(self.allocator, tts);
+            try body_list.append(self.allocator, '"');
+        }
+        try body_list.appendSlice(self.allocator, ",\"blocks\":[{\"type\":\"section\",\"text\":{\"type\":\"mrkdwn\",\"text\":");
+        try root.json_util.appendJsonString(body_list, self.allocator, mrkdwn_text);
+        try body_list.appendSlice(self.allocator, "}},{\"type\":\"actions\",\"elements\":[");
+        for (choices, 0..) |choice, i| {
+            if (i > 0) try body_list.append(self.allocator, ',');
+            const callback_value = try std.fmt.allocPrint(self.allocator, "{s}{s}:{d}", .{ CALLBACK_VALUE_PREFIX, token, i });
+            defer self.allocator.free(callback_value);
+
+            try body_list.appendSlice(self.allocator, "{\"type\":\"button\",\"text\":{\"type\":\"plain_text\",\"text\":");
+            try root.json_util.appendJsonString(body_list, self.allocator, choice.label);
+            try body_list.appendSlice(self.allocator, "},\"value\":");
+            try root.json_util.appendJsonString(body_list, self.allocator, callback_value);
+            try body_list.appendSlice(self.allocator, ",\"action_id\":");
+            try root.json_util.appendJsonString(body_list, self.allocator, choice.id);
+            try body_list.append(self.allocator, '}');
+        }
+        try body_list.appendSlice(self.allocator, "]}]}");
+    }
+
     /// Send a message to a Slack channel via chat.postMessage API.
     /// The target may contain "channel_id:thread_ts" for threaded replies.
     pub fn sendMessage(self: *SlackChannel, target_channel: []const u8, text: []const u8) !void {
@@ -640,29 +1118,56 @@ pub const SlackChannel = struct {
         // Build JSON body
         var body_list: std.ArrayListUnmanaged(u8) = .empty;
         defer body_list.deinit(self.allocator);
-
-        try body_list.appendSlice(self.allocator, "{\"channel\":\"");
-        try body_list.appendSlice(self.allocator, actual_channel);
-        try body_list.appendSlice(self.allocator, "\",\"mrkdwn\":true,\"text\":");
-        try root.json_util.appendJsonString(&body_list, self.allocator, text);
-        if (self.thread_ts) |tts| {
-            try body_list.appendSlice(self.allocator, ",\"thread_ts\":\"");
-            try body_list.appendSlice(self.allocator, tts);
-            try body_list.append(self.allocator, '"');
-        }
-        try body_list.append(self.allocator, '}');
+        try self.appendPostMessageBody(&body_list, actual_channel, text);
 
         // Build auth header: "Authorization: Bearer xoxb-..."
         var auth_buf: [512]u8 = undefined;
         var auth_fbs = std.io.fixedBufferStream(&auth_buf);
-        try auth_fbs.writer().print("Authorization: Bearer {s}", .{self.bot_token});
+        try auth_fbs.writer().print("Authorization: Bearer {s}", .{self.normalizedBotToken()});
         const auth_header = auth_fbs.getWritten();
 
         const resp = root.http_util.curlPost(self.allocator, url, body_list.items, &.{auth_header}) catch |err| {
             log.err("Slack API POST failed: {}", .{err});
             return error.SlackApiError;
         };
-        self.allocator.free(resp);
+        defer self.allocator.free(resp);
+
+        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, resp, .{}) catch return error.SlackApiError;
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.SlackApiError;
+        try ensureSlackApiOk(parsed.value.object, "chat.postMessage", actual_channel);
+    }
+
+    pub fn sendRichPayload(self: *SlackChannel, target_channel: []const u8, payload: root.Channel.OutboundPayload) !void {
+        if (payload.attachments.len > 0) return error.NotSupported;
+        if (payload.choices.len == 0) return self.sendMessage(target_channel, payload.text);
+        if (!validateChoices(payload.choices)) return error.InvalidChoices;
+
+        const actual_channel = self.parseTarget(target_channel);
+        const token = try self.nextInteractionToken();
+        defer self.allocator.free(token);
+
+        var body_list: std.ArrayListUnmanaged(u8) = .empty;
+        defer body_list.deinit(self.allocator);
+        try self.appendInteractivePostMessageBody(&body_list, actual_channel, payload.text, token, payload.choices);
+
+        var auth_buf: [512]u8 = undefined;
+        var auth_fbs = std.io.fixedBufferStream(&auth_buf);
+        try auth_fbs.writer().print("Authorization: Bearer {s}", .{self.normalizedBotToken()});
+        const auth_header = auth_fbs.getWritten();
+
+        const resp = root.http_util.curlPost(self.allocator, API_BASE ++ "/chat.postMessage", body_list.items, &.{auth_header}) catch |err| {
+            log.err("Slack API POST failed: {}", .{err});
+            return error.SlackApiError;
+        };
+        defer self.allocator.free(resp);
+
+        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, resp, .{}) catch return error.SlackApiError;
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.SlackApiError;
+        try ensureSlackApiOk(parsed.value.object, "chat.postMessage", actual_channel);
+
+        try self.registerPendingInteraction(token, target_channel, null, payload.choices);
     }
 
     /// Set Slack Assistant thread status (best-effort, errors ignored).
@@ -685,7 +1190,7 @@ pub const SlackChannel = struct {
 
         var auth_buf: [512]u8 = undefined;
         var auth_fbs = std.io.fixedBufferStream(&auth_buf);
-        auth_fbs.writer().print("Authorization: Bearer {s}", .{self.bot_token}) catch return;
+        auth_fbs.writer().print("Authorization: Bearer {s}", .{self.normalizedBotToken()}) catch return;
         const auth_header = auth_fbs.getWritten();
 
         const resp = root.http_util.curlPost(self.allocator, url, body_list.items, &.{auth_header}) catch return;
@@ -719,15 +1224,25 @@ pub const SlackChannel = struct {
     fn vtableStart(ptr: *anyopaque) anyerror!void {
         const self: *SlackChannel = @ptrCast(@alignCast(ptr));
         if (self.running.load(.acquire)) return;
+        if (!self.hasValidBotToken()) return error.SlackBotTokenRequired;
 
         self.running.store(true, .release);
         errdefer self.running.store(false, .release);
         self.connected.store(false, .release);
 
         // Best-effort bot identity fetch for mention-only policies.
+        var fetched_bot_identity = true;
         self.fetchBotUserId() catch |err| {
+            if (err == error.SlackAuthFailed) {
+                log.err("Slack auth.test failed due authentication error; refusing to start Slack channel.", .{});
+                return err;
+            }
             log.warn("Slack auth.test failed: {}", .{err});
+            fetched_bot_identity = false;
         };
+        if (fetched_bot_identity) {
+            try self.ensureSocketTokenPairMatches();
+        }
 
         switch (self.mode) {
             .socket => {
@@ -780,6 +1295,15 @@ pub const SlackChannel = struct {
             self.allocator.free(uid);
             self.bot_user_id = null;
         }
+        if (self.bot_team_id) |team_id| {
+            self.allocator.free(team_id);
+            self.bot_team_id = null;
+        }
+        if (self.bot_api_app_id) |api_app_id| {
+            self.allocator.free(api_app_id);
+            self.bot_api_app_id = null;
+        }
+        self.deinitPendingInteractions();
         self.clearChannelCursors();
         if (self.last_ts_owned) {
             self.allocator.free(self.last_ts);
@@ -791,6 +1315,11 @@ pub const SlackChannel = struct {
     fn vtableSend(ptr: *anyopaque, target: []const u8, message: []const u8, _: []const []const u8) anyerror!void {
         const self: *SlackChannel = @ptrCast(@alignCast(ptr));
         try self.sendMessage(target, message);
+    }
+
+    fn vtableSendRich(ptr: *anyopaque, target: []const u8, payload: root.Channel.OutboundPayload) anyerror!void {
+        const self: *SlackChannel = @ptrCast(@alignCast(ptr));
+        try self.sendRichPayload(target, payload);
     }
 
     fn vtableName(ptr: *anyopaque) []const u8 {
@@ -817,6 +1346,7 @@ pub const SlackChannel = struct {
         .start = &vtableStart,
         .stop = &vtableStop,
         .send = &vtableSend,
+        .sendRich = &vtableSendRich,
         .name = &vtableName,
         .healthCheck = &vtableHealthCheck,
         .startTyping = &vtableStartTyping,
@@ -1081,12 +1611,8 @@ test "slack channel health check" {
     try std.testing.expect(ch.healthCheck());
 }
 
-test "slack socket thread stack size is architecture-aware" {
-    if (builtin.cpu.arch == .aarch64 or builtin.cpu.arch == .arm) {
-        try std.testing.expectEqual(@as(usize, 1024 * 1024), SlackChannel.SOCKET_THREAD_STACK_SIZE);
-    } else {
-        try std.testing.expectEqual(@as(usize, 256 * 1024), SlackChannel.SOCKET_THREAD_STACK_SIZE);
-    }
+test "slack socket thread stack size is 2MB" {
+    try std.testing.expectEqual(@as(usize, 2 * 1024 * 1024), SlackChannel.SOCKET_THREAD_STACK_SIZE);
 }
 
 test "slack fallback to polling when app token is missing and polling targets exist" {
@@ -1114,6 +1640,141 @@ test "slack socket reconnect does not count toward fallback failures" {
     try std.testing.expect(!SlackChannel.shouldCountSocketFailure(error.ShouldReconnect));
     try std.testing.expect(SlackChannel.shouldCountSocketFailure(error.SlackApiError));
     try std.testing.expect(SlackChannel.shouldCountSocketFailure(error.SlackAppTokenRequired));
+}
+
+test "slack auth failure code classification" {
+    try std.testing.expect(SlackChannel.isAuthFailureCode("invalid_auth"));
+    try std.testing.expect(SlackChannel.isAuthFailureCode("not_authed"));
+    try std.testing.expect(SlackChannel.isAuthFailureCode("missing_scope"));
+    try std.testing.expect(SlackChannel.isAuthFailureCode("not_allowed_token_type"));
+    try std.testing.expect(!SlackChannel.isAuthFailureCode("rate_limited"));
+}
+
+test "ensureSlackApiOk maps auth failures to SlackAuthFailed" {
+    const payload =
+        \\{"ok":false,"error":"missing_scope","needed":"chat:write","provided":"commands"}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
+    defer parsed.deinit();
+    try std.testing.expectError(
+        error.SlackAuthFailed,
+        SlackChannel.ensureSlackApiOk(parsed.value.object, "chat.postMessage", "C123"),
+    );
+}
+
+test "ensureSlackApiOk maps non-auth failures to SlackApiError" {
+    const payload =
+        \\{"ok":false,"error":"channel_not_found"}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
+    defer parsed.deinit();
+    try std.testing.expectError(
+        error.SlackApiError,
+        SlackChannel.ensureSlackApiOk(parsed.value.object, "chat.postMessage", "C123"),
+    );
+}
+
+test "hasValidBotToken rejects blank token" {
+    var ch = SlackChannel.init(std.testing.allocator, "   ", null, null, &.{});
+    try std.testing.expect(!ch.hasValidBotToken());
+}
+
+test "normalized token helpers trim whitespace" {
+    var ch = SlackChannel.init(std.testing.allocator, "  xoxb-test \n", "\t xapp-1-A123-xyz  ", null, &.{});
+    try std.testing.expectEqualStrings("xoxb-test", ch.normalizedBotToken());
+    try std.testing.expectEqualStrings("xapp-1-A123-xyz", ch.normalizedAppToken().?);
+}
+
+test "parseApiAppIdFromAppToken extracts id" {
+    const parsed = SlackChannel.parseApiAppIdFromAppToken(" xapp-1-a1b2c3-token ");
+    try std.testing.expect(parsed != null);
+    try std.testing.expectEqualStrings("a1b2c3", parsed.?);
+}
+
+test "parseApiAppIdFromAppToken rejects malformed tokens" {
+    try std.testing.expect(SlackChannel.parseApiAppIdFromAppToken("") == null);
+    try std.testing.expect(SlackChannel.parseApiAppIdFromAppToken("xoxb-123") == null);
+    try std.testing.expect(SlackChannel.parseApiAppIdFromAppToken("xapp-no-version-A123-foo") == null);
+    try std.testing.expect(SlackChannel.parseApiAppIdFromAppToken("xapp-1--foo") == null);
+    try std.testing.expect(SlackChannel.parseApiAppIdFromAppToken("xapp-1-A123") == null);
+}
+
+test "ensureSocketTokenPairMatches rejects mismatched api_app_id" {
+    var ch = SlackChannel.init(std.testing.allocator, "xoxb-test", "xapp-1-B222-foo", null, &.{});
+    ch.mode = .socket;
+    ch.bot_api_app_id = try std.testing.allocator.dupe(u8, "A111");
+    defer {
+        if (ch.bot_api_app_id) |api_app_id| std.testing.allocator.free(api_app_id);
+        ch.bot_api_app_id = null;
+    }
+
+    try std.testing.expectError(error.SlackAuthFailed, ch.ensureSocketTokenPairMatches());
+}
+
+test "ensureSocketTokenPairMatches accepts matching api_app_id ignoring case" {
+    var ch = SlackChannel.init(std.testing.allocator, "xoxb-test", "xapp-1-a111-foo", null, &.{});
+    ch.mode = .socket;
+    ch.bot_api_app_id = try std.testing.allocator.dupe(u8, "A111");
+    defer {
+        if (ch.bot_api_app_id) |api_app_id| std.testing.allocator.free(api_app_id);
+        ch.bot_api_app_id = null;
+    }
+
+    try ch.ensureSocketTokenPairMatches();
+}
+
+test "shouldDropMismatchedSocketEvent drops api_app_id mismatch" {
+    var ch = SlackChannel.init(std.testing.allocator, "xoxb-test", "xapp-1-A111-foo", null, &.{});
+    ch.bot_api_app_id = try std.testing.allocator.dupe(u8, "A111");
+    defer {
+        if (ch.bot_api_app_id) |api_app_id| std.testing.allocator.free(api_app_id);
+        ch.bot_api_app_id = null;
+    }
+
+    const payload =
+        \\{"api_app_id":"A222","team_id":"T1"}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .object);
+    try std.testing.expect(ch.shouldDropMismatchedSocketEvent(parsed.value.object));
+}
+
+test "shouldDropMismatchedSocketEvent drops team_id mismatch" {
+    var ch = SlackChannel.init(std.testing.allocator, "xoxb-test", "xapp-1-A111-foo", null, &.{});
+    ch.bot_team_id = try std.testing.allocator.dupe(u8, "T111");
+    defer {
+        if (ch.bot_team_id) |team_id| std.testing.allocator.free(team_id);
+        ch.bot_team_id = null;
+    }
+
+    const payload =
+        \\{"api_app_id":"A111","team_id":"T222"}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .object);
+    try std.testing.expect(ch.shouldDropMismatchedSocketEvent(parsed.value.object));
+}
+
+test "shouldDropMismatchedSocketEvent keeps matching scope" {
+    var ch = SlackChannel.init(std.testing.allocator, "xoxb-test", "xapp-1-A111-foo", null, &.{});
+    ch.bot_api_app_id = try std.testing.allocator.dupe(u8, "A111");
+    ch.bot_team_id = try std.testing.allocator.dupe(u8, "T111");
+    defer {
+        if (ch.bot_api_app_id) |api_app_id| std.testing.allocator.free(api_app_id);
+        ch.bot_api_app_id = null;
+        if (ch.bot_team_id) |team_id| std.testing.allocator.free(team_id);
+        ch.bot_team_id = null;
+    }
+
+    const payload =
+        \\{"api_app_id":"A111","team_id":"T111"}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .object);
+    try std.testing.expect(!ch.shouldDropMismatchedSocketEvent(parsed.value.object));
 }
 
 test "slack channel user allowed wildcard" {
@@ -1247,7 +1908,8 @@ test "slack processHistoryMessage publishes inbound message to bus" {
     defer msg.deinit(alloc);
     try std.testing.expectEqualStrings("slack", msg.channel);
     try std.testing.expectEqualStrings("U123", msg.sender_id);
-    try std.testing.expectEqualStrings("C12345", msg.chat_id);
+    // thread_ts (1700000000.000) != ts (1700000000.100) → thread reply; chat_id includes thread_ts
+    try std.testing.expectEqualStrings("C12345:1700000000.000", msg.chat_id);
     try std.testing.expectEqualStrings("slack:sl-main:channel:C12345", msg.session_key);
     try std.testing.expectEqualStrings("hello from slack", msg.content);
     try std.testing.expect(msg.metadata_json != null);
@@ -1256,6 +1918,98 @@ test "slack processHistoryMessage publishes inbound message to bus" {
     try std.testing.expect(meta.value == .object);
     try std.testing.expectEqualStrings("1700000000.100", meta.value.object.get("message_id").?.string);
     try std.testing.expectEqualStrings("1700000000.000", meta.value.object.get("thread_id").?.string);
+}
+
+test "processHistoryMessage off mode top-level post uses channel_id as chat_id" {
+    const alloc = std.testing.allocator;
+    var eb = bus_mod.Bus.init();
+    defer eb.close();
+
+    const allowed = [_][]const u8{"*"};
+    var ch = SlackChannel.init(alloc, "tok", null, "C99", &allowed);
+    ch.account_id = "sl-main";
+    ch.setBus(&eb);
+    // reply_to_mode defaults to .off
+
+    // thread_ts == ts: top-level post that started a thread, not a reply
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"user":"U1","text":"hi","ts":"1700000001.000","thread_ts":"1700000001.000"}
+    , .{});
+    defer parsed.deinit();
+
+    try ch.processHistoryMessage(parsed.value.object, "C99");
+
+    var msg = eb.consumeInbound() orelse return error.TestExpectedEqual;
+    defer msg.deinit(alloc);
+    try std.testing.expectEqualStrings("C99", msg.chat_id);
+}
+
+test "processHistoryMessage off mode no thread_ts uses channel_id as chat_id" {
+    const alloc = std.testing.allocator;
+    var eb = bus_mod.Bus.init();
+    defer eb.close();
+
+    const allowed = [_][]const u8{"*"};
+    var ch = SlackChannel.init(alloc, "tok", null, "C99", &allowed);
+    ch.account_id = "sl-main";
+    ch.setBus(&eb);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"user":"U1","text":"hi","ts":"1700000001.000"}
+    , .{});
+    defer parsed.deinit();
+
+    try ch.processHistoryMessage(parsed.value.object, "C99");
+
+    var msg = eb.consumeInbound() orelse return error.TestExpectedEqual;
+    defer msg.deinit(alloc);
+    try std.testing.expectEqualStrings("C99", msg.chat_id);
+}
+
+test "processHistoryMessage all mode no thread_ts uses message_ts as thread" {
+    const alloc = std.testing.allocator;
+    var eb = bus_mod.Bus.init();
+    defer eb.close();
+
+    const allowed = [_][]const u8{"*"};
+    var ch = SlackChannel.init(alloc, "tok", null, "C99", &allowed);
+    ch.account_id = "sl-main";
+    ch.reply_to_mode = .all;
+    ch.setBus(&eb);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"user":"U1","text":"hi","ts":"1700000001.000"}
+    , .{});
+    defer parsed.deinit();
+
+    try ch.processHistoryMessage(parsed.value.object, "C99");
+
+    var msg = eb.consumeInbound() orelse return error.TestExpectedEqual;
+    defer msg.deinit(alloc);
+    try std.testing.expectEqualStrings("C99:1700000001.000", msg.chat_id);
+}
+
+test "processHistoryMessage all mode with thread_ts uses thread_ts" {
+    const alloc = std.testing.allocator;
+    var eb = bus_mod.Bus.init();
+    defer eb.close();
+
+    const allowed = [_][]const u8{"*"};
+    var ch = SlackChannel.init(alloc, "tok", null, "C99", &allowed);
+    ch.account_id = "sl-main";
+    ch.reply_to_mode = .all;
+    ch.setBus(&eb);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"user":"U1","text":"hi","ts":"1700000002.000","thread_ts":"1700000001.000"}
+    , .{});
+    defer parsed.deinit();
+
+    try ch.processHistoryMessage(parsed.value.object, "C99");
+
+    var msg = eb.consumeInbound() orelse return error.TestExpectedEqual;
+    defer msg.deinit(alloc);
+    try std.testing.expectEqualStrings("C99:1700000001.000", msg.chat_id);
 }
 
 test "mrkdwn bold conversion" {
@@ -1352,6 +2106,54 @@ test "mrkdwn bullets with bold items" {
 test "slack channel vtable compiles" {
     const vt = SlackChannel.vtable;
     try std.testing.expect(@TypeOf(vt) == root.Channel.VTable);
+}
+
+test "sendMessage payload converts markdown to mrkdwn" {
+    const allowed = [_][]const u8{};
+    var ch = SlackChannel.init(std.testing.allocator, "tok", null, null, &allowed);
+
+    var body_list: std.ArrayListUnmanaged(u8) = .empty;
+    defer body_list.deinit(std.testing.allocator);
+
+    try ch.appendPostMessageBody(&body_list, "C123", "**hello** world");
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body_list.items, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .object);
+
+    const text_value = parsed.value.object.get("text") orelse return error.TestExpectedEqual;
+    try std.testing.expect(text_value == .string);
+    try std.testing.expectEqualStrings("*hello* world", text_value.string);
+
+    const mrkdwn_value = parsed.value.object.get("mrkdwn") orelse return error.TestExpectedEqual;
+    try std.testing.expect(mrkdwn_value == .bool and mrkdwn_value.bool);
+}
+
+test "slack pending interactions survive across channel instances" {
+    var sender = SlackChannel.init(std.testing.allocator, "tok", null, null, &.{});
+    sender.account_id = "main";
+    defer sender.deinitPendingInteractions();
+
+    const choices = [_]root.Channel.OutboundChoice{
+        .{ .id = "yes", .label = "Yes", .submit_text = "Confirm action" },
+    };
+    try sender.registerPendingInteraction("tok1", "C123:1700.1", null, &choices);
+
+    var receiver = SlackChannel.init(std.testing.allocator, "tok", null, null, &.{});
+    receiver.account_id = "main";
+
+    const result = receiver.consumeInteractionSelection("tok1", 0, "U123");
+    switch (result) {
+        .ok => |selection| {
+            defer std.testing.allocator.free(selection.submit_text);
+            defer std.testing.allocator.free(selection.target);
+            try std.testing.expectEqualStrings("Confirm action", selection.submit_text);
+            try std.testing.expectEqualStrings("C123:1700.1", selection.target);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    try std.testing.expect(receiver.consumeInteractionSelection("tok1", 0, "U123") == .not_found);
 }
 
 test "slack channel interface returns slack name" {

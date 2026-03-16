@@ -4,27 +4,28 @@
 //! and navigation. Preserves headings, links, and lists.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const root = @import("root.zig");
 const Tool = root.Tool;
 const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
 const net_security = @import("../root.zig").net_security;
+const http_util = @import("../http_util.zig");
+
+const log = std.log.scoped(.web_fetch);
 
 /// Default max chars for extracted content.
 const DEFAULT_MAX_CHARS: usize = 50_000;
-const WEB_FETCH_HEADERS = [_]std.http.Header{
-    .{ .name = "User-Agent", .value = "nullclaw/0.1 (web_fetch tool)" },
-    .{ .name = "Accept", .value = "text/html,application/json,text/plain,*/*" },
-};
 
 /// Web fetch tool — fetches URLs and extracts readable content.
 pub const WebFetchTool = struct {
     default_max_chars: usize = DEFAULT_MAX_CHARS,
+    allowed_domains: []const []const u8 = &.{}, // empty = allow all
 
     pub const tool_name = "web_fetch";
-    pub const tool_description = "Fetch a web page and extract its text content. Converts HTML to readable text with markdown formatting.";
+    pub const tool_description = "Fetch an HTTPS web page and extract its text content. Converts HTML to readable text with markdown formatting.";
     pub const tool_params =
-        \\{"type":"object","properties":{"url":{"type":"string","description":"URL to fetch (http or https)"},"max_chars":{"type":"integer","default":50000,"description":"Maximum characters to return"}},"required":["url"]}
+        \\{"type":"object","properties":{"url":{"type":"string","description":"HTTPS URL to fetch"},"max_chars":{"type":"integer","default":50000,"description":"Maximum characters to return"}},"required":["url"]}
     ;
 
     const vtable = root.ToolVTable(@This());
@@ -40,73 +41,94 @@ pub const WebFetchTool = struct {
         const url = root.getString(args, "url") orelse
             return ToolResult.fail("Missing required 'url' parameter");
 
-        // Validate URL scheme
-        if (!std.mem.startsWith(u8, url, "http://") and !std.mem.startsWith(u8, url, "https://")) {
-            return ToolResult.fail("Only http:// and https:// URLs are allowed");
+        // Validate URL scheme - HTTPS only for security (AGENTS.md policy)
+        if (!std.mem.startsWith(u8, url, "https://")) {
+            return ToolResult.fail("Only HTTPS URLs are allowed for security");
         }
 
         const uri = std.Uri.parse(url) catch
             return ToolResult.fail("Invalid URL format");
-        const default_port: u16 = if (std.ascii.eqlIgnoreCase(uri.scheme, "https")) 443 else 80;
-        const resolved_port: u16 = uri.port orelse default_port;
+        const resolved_port: u16 = uri.port orelse 443;
 
-        // SSRF protection and DNS-rebinding hardening:
-        // resolve once, validate global address, and connect directly to it.
+        // Extract host
         const host = net_security.extractHost(url) orelse
             return ToolResult.fail("Invalid URL: cannot extract host");
-        const connect_host = net_security.resolveConnectHost(allocator, host, resolved_port) catch |err| switch (err) {
-            error.LocalAddressBlocked => return ToolResult.fail("Blocked local/private host"),
-            else => return ToolResult.fail("Unable to verify host safety"),
-        };
+
+        // Check domain allowlist BEFORE any DNS resolution.
+        // This prevents DNS exfiltration and avoids unnecessary network calls.
+        const is_allowlisted = if (self.allowed_domains.len > 0)
+            net_security.hostMatchesAllowlist(host, self.allowed_domains)
+        else
+            false;
+
+        // Reject non-allowlisted hosts when allowlist is configured
+        if (self.allowed_domains.len > 0 and !is_allowlisted) {
+            return ToolResult.fail("Host is not in http_request.allowed_domains");
+        }
+
+        // SSRF protection: skip for allowlisted hosts (fixes #393).
+        // Allowlisted hosts can resolve to private IPs (e.g., local searxng).
+        // Non-allowlisted hosts require global address validation.
+        //
+        // Security trade-off for allowlisted hosts:
+        // - resolveConnectHost normally pins DNS results to curl via --resolve,
+        //   preventing DNS rebinding attacks between resolution and connection.
+        // - For allowlisted hosts, we skip this and let curl resolve the hostname.
+        //   This is acceptable because the operator explicitly trusts these domains
+        //   (e.g., internal services like searxng on private IPs).
+        // - DNS rebinding protection is intentionally traded for operational flexibility.
+        const connect_host: []const u8 = if (is_allowlisted)
+            // Allowlisted: trust the operator, skip SSRF check and DNS pinning.
+            // curl will resolve the hostname itself (no --resolve pinning).
+            try allocator.dupe(u8, host)
+        else
+            // No allowlist configured: enforce SSRF for all external hosts.
+            // DNS results are pinned to prevent rebinding attacks.
+            net_security.resolveConnectHost(allocator, host, resolved_port) catch |err| switch (err) {
+                error.LocalAddressBlocked => return ToolResult.fail("Blocked local/private host"),
+                else => return ToolResult.fail("Unable to verify host safety"),
+            };
         defer allocator.free(connect_host);
 
         const max_chars = parseMaxCharsWithDefault(args, self.default_max_chars);
 
-        // Fetch URL
-        var client: std.http.Client = .{ .allocator = allocator };
-        defer client.deinit();
-
-        const protocol: std.http.Client.Protocol = if (std.ascii.eqlIgnoreCase(uri.scheme, "https")) .tls else .plain;
-        const authority_host = stripHostBrackets(host);
-        const connection = client.connectTcpOptions(.{
-            .host = connect_host,
-            .port = resolved_port,
-            .protocol = protocol,
-            .proxied_host = authority_host,
-            .proxied_port = resolved_port,
-        }) catch |err| {
-            const msg = try std.fmt.allocPrint(allocator, "Fetch failed: {}", .{err});
-            return ToolResult{ .success = false, .output = "", .error_msg = msg };
-        };
-
-        var req = client.request(.GET, uri, buildRequestOptions(connection)) catch |err| {
-            const msg = try std.fmt.allocPrint(allocator, "Fetch failed: {}", .{err});
-            return ToolResult{ .success = false, .output = "", .error_msg = msg };
-        };
-        defer req.deinit();
-
-        req.sendBodiless() catch |err| {
-            const msg = try std.fmt.allocPrint(allocator, "Failed to send request: {}", .{err});
-            return ToolResult{ .success = false, .output = "", .error_msg = msg };
-        };
-
-        var redirect_buf: [4096]u8 = undefined;
-        var response = req.receiveHead(&redirect_buf) catch |err| {
-            const msg = try std.fmt.allocPrint(allocator, "Failed to receive response: {}", .{err});
-            return ToolResult{ .success = false, .output = "", .error_msg = msg };
-        };
-
-        const status_code = @intFromEnum(response.head.status);
-        if (!isSuccessStatus(status_code)) {
-            const msg = try std.fmt.allocPrint(allocator, "HTTP {d}", .{status_code});
-            return ToolResult{ .success = false, .output = "", .error_msg = msg };
+        if (builtin.is_test) {
+            return ToolResult.fail("Network disabled in tests");
         }
 
-        // Read body (limit to 2MB)
-        var transfer_buf: [8192]u8 = undefined;
-        const reader = response.reader(&transfer_buf);
-        const body = reader.readAlloc(allocator, 2 * 1024 * 1024) catch |err| {
-            const msg = try std.fmt.allocPrint(allocator, "Failed to read response: {}", .{err});
+        // Fetch URL via curl subprocess
+        const headers = [_][]const u8{
+            "User-Agent: nullclaw/0.1 (web_fetch tool)",
+            "Accept: text/html,application/json,text/plain,*/*",
+        };
+
+        const body = blk: {
+            const use_dns_pinning = shouldUseCurlResolve(host) and !std.mem.eql(u8, host, connect_host);
+            if (use_dns_pinning) {
+                const resolve_entry = try buildCurlResolveEntry(allocator, host, resolved_port, connect_host);
+                defer allocator.free(resolve_entry);
+                break :blk http_util.curlGetWithResolve(
+                    allocator,
+                    url,
+                    &headers,
+                    "30",
+                    resolve_entry,
+                );
+            }
+            break :blk http_util.curlGet(
+                allocator,
+                url,
+                &headers,
+                "30",
+            );
+        } catch |err| {
+            if (!builtin.is_test) {
+                log.err("web_fetch connection failed for {s}: {}", .{ url, err });
+            }
+            if (err == error.CurlInterrupted) {
+                return ToolResult.fail("Interrupted by /stop");
+            }
+            const msg = try std.fmt.allocPrint(allocator, "Fetch failed: {}", .{err});
             return ToolResult{ .success = false, .output = "", .error_msg = msg };
         };
         defer allocator.free(body);
@@ -140,23 +162,26 @@ fn parseMaxCharsWithDefault(args: JsonObjectMap, default: usize) usize {
     return @intCast(val_i64);
 }
 
-fn buildRequestOptions(connection: ?*std.http.Client.Connection) std.http.Client.RequestOptions {
-    return .{
-        .extra_headers = &WEB_FETCH_HEADERS,
-        .redirect_behavior = .unhandled,
-        .connection = connection,
-    };
+fn shouldUseCurlResolve(host: []const u8) bool {
+    // DNS pinning is required for hostname-based URLs. IPv6 literals do not
+    // involve DNS and don't fit curl's host:port `--resolve` syntax cleanly.
+    return std.mem.indexOfScalar(u8, net_security.stripHostBrackets(host), ':') == null;
 }
 
-fn isSuccessStatus(status_code: u16) bool {
-    return status_code >= 200 and status_code < 300;
-}
+fn buildCurlResolveEntry(
+    allocator: std.mem.Allocator,
+    host: []const u8,
+    port: u16,
+    connect_host: []const u8,
+) ![]u8 {
+    const host_for_resolve = net_security.stripHostBrackets(host);
+    const connect_target = if (std.mem.indexOfScalar(u8, connect_host, ':') != null)
+        try std.fmt.allocPrint(allocator, "[{s}]", .{connect_host})
+    else
+        try allocator.dupe(u8, connect_host);
+    defer allocator.free(connect_target);
 
-fn stripHostBrackets(host: []const u8) []const u8 {
-    if (std.mem.startsWith(u8, host, "[") and std.mem.endsWith(u8, host, "]")) {
-        return host[1 .. host.len - 1];
-    }
-    return host;
+    return std.fmt.allocPrint(allocator, "{s}:{d}:{s}", .{ host_for_resolve, port, connect_target });
 }
 
 /// Convert HTML to readable text with basic markdown formatting.
@@ -438,8 +463,13 @@ test "WebFetchTool name and description" {
     var wft = WebFetchTool{};
     const t = wft.tool();
     try testing.expectEqualStrings("web_fetch", t.name());
-    try testing.expect(t.description().len > 0);
-    try testing.expect(t.parametersJson()[0] == '{');
+    const description = t.description();
+    const schema = t.parametersJson();
+    try testing.expect(description.len > 0);
+    try testing.expect(std.mem.indexOf(u8, description, "HTTPS") != null);
+    try testing.expect(schema[0] == '{');
+    try testing.expect(std.mem.indexOf(u8, schema, "HTTPS URL to fetch") != null);
+    try testing.expect(std.mem.indexOf(u8, schema, "http or https") == null);
 }
 
 test "WebFetchTool missing url fails" {
@@ -451,18 +481,27 @@ test "WebFetchTool missing url fails" {
     try testing.expectEqualStrings("Missing required 'url' parameter", result.error_msg.?);
 }
 
-test "WebFetchTool non-http url fails" {
+test "WebFetchTool HTTP URL rejected (HTTPS-only policy)" {
+    var wft = WebFetchTool{};
+    const parsed = try root.parseTestArgs("{\"url\":\"http://example.com\"}");
+    defer parsed.deinit();
+    const result = try wft.execute(testing.allocator, parsed.value.object);
+    try testing.expect(!result.success);
+    try testing.expect(std.mem.indexOf(u8, result.error_msg.?, "HTTPS") != null);
+}
+
+test "WebFetchTool non-HTTP scheme rejected" {
     var wft = WebFetchTool{};
     const parsed = try root.parseTestArgs("{\"url\":\"ftp://example.com\"}");
     defer parsed.deinit();
     const result = try wft.execute(testing.allocator, parsed.value.object);
     try testing.expect(!result.success);
-    try testing.expectEqualStrings("Only http:// and https:// URLs are allowed", result.error_msg.?);
+    try testing.expect(std.mem.indexOf(u8, result.error_msg.?, "HTTPS") != null);
 }
 
 test "WebFetchTool localhost blocked" {
     var wft = WebFetchTool{};
-    const parsed = try root.parseTestArgs("{\"url\":\"http://localhost:8080/api\"}");
+    const parsed = try root.parseTestArgs("{\"url\":\"https://localhost:8080/api\"}");
     defer parsed.deinit();
     const result = try wft.execute(testing.allocator, parsed.value.object);
     try testing.expect(!result.success);
@@ -471,15 +510,15 @@ test "WebFetchTool localhost blocked" {
 
 test "WebFetchTool private IP blocked" {
     var wft = WebFetchTool{};
-    const p1 = try root.parseTestArgs("{\"url\":\"http://192.168.1.1/\"}");
+    const p1 = try root.parseTestArgs("{\"url\":\"https://192.168.1.1/\"}");
     defer p1.deinit();
     const r1 = try wft.execute(testing.allocator, p1.value.object);
     try testing.expect(!r1.success);
-    const p2 = try root.parseTestArgs("{\"url\":\"http://10.0.0.1/\"}");
+    const p2 = try root.parseTestArgs("{\"url\":\"https://10.0.0.1/\"}");
     defer p2.deinit();
     const r2 = try wft.execute(testing.allocator, p2.value.object);
     try testing.expect(!r2.success);
-    const p3 = try root.parseTestArgs("{\"url\":\"http://127.0.0.1/\"}");
+    const p3 = try root.parseTestArgs("{\"url\":\"https://127.0.0.1/\"}");
     defer p3.deinit();
     const r3 = try wft.execute(testing.allocator, p3.value.object);
     try testing.expect(!r3.success);
@@ -487,33 +526,61 @@ test "WebFetchTool private IP blocked" {
 
 test "WebFetchTool loopback decimal alias blocked" {
     var wft = WebFetchTool{};
-    const parsed = try root.parseTestArgs("{\"url\":\"http://2130706433/\"}");
+    const parsed = try root.parseTestArgs("{\"url\":\"https://2130706433/\"}");
     defer parsed.deinit();
     const result = try wft.execute(testing.allocator, parsed.value.object);
     try testing.expect(!result.success);
     try testing.expectEqualStrings("Blocked local/private host", result.error_msg.?);
 }
 
-test "web_fetch disables automatic redirects" {
-    const opts = buildRequestOptions(null);
-    try testing.expect(opts.redirect_behavior == .unhandled);
-    try testing.expect(opts.connection == null);
+test "WebFetchTool blocked when host is not in allowlist" {
+    const domains = [_][]const u8{"example.com"};
+    var wft = WebFetchTool{ .allowed_domains = &domains };
+    const parsed = try root.parseTestArgs("{\"url\":\"https://google.com\"}");
+    defer parsed.deinit();
+    const result = try wft.execute(testing.allocator, parsed.value.object);
+    try testing.expect(!result.success);
+    try testing.expectEqualStrings("Host is not in http_request.allowed_domains", result.error_msg.?);
 }
 
-test "web_fetch request options keep provided connection" {
-    const fake_ptr_value = @as(usize, @alignOf(std.http.Client.Connection));
-    const fake_connection: *std.http.Client.Connection = @ptrFromInt(fake_ptr_value);
-    const opts = buildRequestOptions(fake_connection);
-    try testing.expect(opts.connection != null);
-    try testing.expectEqual(@intFromPtr(fake_connection), @intFromPtr(opts.connection.?));
+test "WebFetchTool allowlisted local host is allowed (fixes #393)" {
+    // Allowlisted hosts can access private IPs - SSRF protection is bypassed
+    const domains = [_][]const u8{"127.0.0.1"};
+    var wft = WebFetchTool{ .allowed_domains = &domains };
+    const parsed = try root.parseTestArgs("{\"url\":\"https://127.0.0.1:8080/\"}");
+    defer parsed.deinit();
+    const result = try wft.execute(testing.allocator, parsed.value.object);
+    try testing.expect(!result.success);
+    try testing.expectEqualStrings("Network disabled in tests", result.error_msg.?);
 }
 
-test "web_fetch treats only 2xx as success" {
-    try testing.expect(isSuccessStatus(200));
-    try testing.expect(isSuccessStatus(299));
-    try testing.expect(!isSuccessStatus(300));
-    try testing.expect(!isSuccessStatus(302));
-    try testing.expect(!isSuccessStatus(404));
+test "WebFetchTool non-allowlisted local host still blocked" {
+    // Local hosts not in allowlist should still be blocked
+    const domains = [_][]const u8{"example.com"};
+    var wft = WebFetchTool{ .allowed_domains = &domains };
+    const parsed = try root.parseTestArgs("{\"url\":\"https://127.0.0.1/\"}");
+    defer parsed.deinit();
+    const result = try wft.execute(testing.allocator, parsed.value.object);
+    try testing.expect(!result.success);
+    // Should fail with allowlist error (checked before SSRF)
+    try testing.expect(std.mem.indexOf(u8, result.error_msg.?, "allowed_domains") != null);
+}
+
+test "buildCurlResolveEntry formats ipv4 connect target" {
+    const entry = try buildCurlResolveEntry(testing.allocator, "example.com", 443, "93.184.216.34");
+    defer testing.allocator.free(entry);
+    try testing.expectEqualStrings("example.com:443:93.184.216.34", entry);
+}
+
+test "buildCurlResolveEntry wraps ipv6 connect target" {
+    const entry = try buildCurlResolveEntry(testing.allocator, "example.com", 443, "2001:db8::1");
+    defer testing.allocator.free(entry);
+    try testing.expectEqualStrings("example.com:443:[2001:db8::1]", entry);
+}
+
+test "shouldUseCurlResolve skips ipv6 literal hosts" {
+    try testing.expect(shouldUseCurlResolve("example.com"));
+    try testing.expect(!shouldUseCurlResolve("[2001:db8::1]"));
 }
 
 test "htmlToText strips script and style" {

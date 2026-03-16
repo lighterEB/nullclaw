@@ -7,6 +7,8 @@
 const std = @import("std");
 const memory_mod = @import("../memory/root.zig");
 const Memory = memory_mod.Memory;
+const bootstrap_mod = @import("../bootstrap/root.zig");
+const mcp_mod = @import("../mcp.zig");
 
 // ── JSON arg extraction helpers ─────────────────────────────────
 // Used by all tool implementations to extract typed fields from
@@ -43,6 +45,14 @@ pub fn getValue(args: JsonObjectMap, key: []const u8) ?JsonValue {
     return args.get(key);
 }
 
+pub fn getStringArray(args: JsonObjectMap, key: []const u8) ?[]const JsonValue {
+    const val = args.get(key) orelse return null;
+    return switch (val) {
+        .array => |a| a.items,
+        else => null,
+    };
+}
+
 /// Test helper: parse a JSON string into a Parsed(Value) for use in tool tests.
 /// The caller must `defer parsed.deinit()` and extract `.value.object` for the ObjectMap.
 pub fn parseTestArgs(json_str: []const u8) !std.json.Parsed(JsonValue) {
@@ -54,6 +64,9 @@ pub const shell = @import("shell.zig");
 pub const file_read = @import("file_read.zig");
 pub const file_write = @import("file_write.zig");
 pub const file_edit = @import("file_edit.zig");
+pub const file_delete = @import("file_delete.zig");
+pub const file_read_hashed = @import("file_read_hashed.zig");
+pub const file_edit_hashed = @import("file_edit_hashed.zig");
 pub const http_request = @import("http_request.zig");
 pub const git = @import("git.zig");
 pub const memory_store = @import("memory_store.zig");
@@ -265,19 +278,28 @@ pub fn allTools(
     workspace_dir: []const u8,
     opts: struct {
         http_enabled: bool = false,
+        http_allowed_domains: []const []const u8 = &.{},
+        http_max_response_size: u32 = 1_000_000,
+        http_timeout_secs: u64 = 30,
+        web_search_base_url: ?[]const u8 = null,
+        web_search_provider: []const u8 = "auto",
+        web_search_fallback_providers: []const []const u8 = &.{},
         browser_enabled: bool = false,
         screenshot_enabled: bool = false,
         composio_api_key: ?[]const u8 = null,
         browser_open_domains: ?[]const []const u8 = null,
         hardware_boards: ?[]const []const u8 = null,
-        mcp_tools: ?[]const Tool = null,
+        mcp_server_configs: []const @import("../config_types.zig").McpServerConfig = &.{},
         agents: ?[]const @import("../config.zig").NamedAgentConfig = null,
+        configured_providers: []const @import("../config_types.zig").ProviderEntry = &.{},
         fallback_api_key: ?[]const u8 = null,
         delegate_depth: u32 = 0,
         subagent_manager: ?*@import("../subagent.zig").SubagentManager = null,
         allowed_paths: []const []const u8 = &.{},
         tools_config: @import("../config.zig").ToolsConfig = .{},
         policy: ?*const @import("../security/policy.zig").SecurityPolicy = null,
+        bootstrap_provider: ?bootstrap_mod.BootstrapProvider = null,
+        backend_name: []const u8 = "hybrid",
     },
 ) ![]Tool {
     var list: std.ArrayList(Tool) = .{};
@@ -298,20 +320,63 @@ pub fn allTools(
         .timeout_ns = tc.shell_timeout_secs * std.time.ns_per_s,
         .max_output_bytes = tc.shell_max_output_bytes,
         .policy = opts.policy,
+        .path_env_vars = tc.path_env_vars,
     };
     try list.append(allocator, st.tool());
 
     const ft = try allocator.create(file_read.FileReadTool);
-    ft.* = .{ .workspace_dir = workspace_dir, .allowed_paths = opts.allowed_paths, .max_file_size = tc.max_file_size_bytes };
+    ft.* = .{
+        .workspace_dir = workspace_dir,
+        .allowed_paths = opts.allowed_paths,
+        .max_file_size = tc.max_file_size_bytes,
+        .bootstrap_provider = opts.bootstrap_provider,
+        .backend_name = opts.backend_name,
+    };
     try list.append(allocator, ft.tool());
 
     const wt = try allocator.create(file_write.FileWriteTool);
-    wt.* = .{ .workspace_dir = workspace_dir, .allowed_paths = opts.allowed_paths };
+    wt.* = .{
+        .workspace_dir = workspace_dir,
+        .allowed_paths = opts.allowed_paths,
+        .bootstrap_provider = opts.bootstrap_provider,
+        .backend_name = opts.backend_name,
+    };
     try list.append(allocator, wt.tool());
 
     const et2 = try allocator.create(file_edit.FileEditTool);
-    et2.* = .{ .workspace_dir = workspace_dir, .allowed_paths = opts.allowed_paths, .max_file_size = tc.max_file_size_bytes };
+    et2.* = .{
+        .workspace_dir = workspace_dir,
+        .allowed_paths = opts.allowed_paths,
+        .max_file_size = tc.max_file_size_bytes,
+        .bootstrap_provider = opts.bootstrap_provider,
+        .backend_name = opts.backend_name,
+    };
     try list.append(allocator, et2.tool());
+
+    const dt = try allocator.create(file_delete.FileDeleteTool);
+    dt.* = .{
+        .workspace_dir = workspace_dir,
+        .allowed_paths = opts.allowed_paths,
+        .bootstrap_provider = opts.bootstrap_provider,
+        .backend_name = opts.backend_name,
+    };
+    try list.append(allocator, dt.tool());
+
+    const frh = try allocator.create(file_read_hashed.FileReadHashedTool);
+    frh.* = .{
+        .workspace_dir = workspace_dir,
+        .allowed_paths = opts.allowed_paths,
+        .max_file_size = tc.max_file_size_bytes,
+    };
+    try list.append(allocator, frh.tool());
+
+    const feh = try allocator.create(file_edit_hashed.FileEditHashedTool);
+    feh.* = .{
+        .workspace_dir = workspace_dir,
+        .allowed_paths = opts.allowed_paths,
+        .max_file_size = tc.max_file_size_bytes,
+    };
+    try list.append(allocator, feh.tool());
 
     const gt = try allocator.create(git.GitTool);
     gt.* = .{ .workspace_dir = workspace_dir };
@@ -343,6 +408,7 @@ pub fn allTools(
     const dlt = try allocator.create(delegate.DelegateTool);
     dlt.* = .{
         .agents = opts.agents orelse &.{},
+        .configured_providers = opts.configured_providers,
         .fallback_api_key = opts.fallback_api_key,
         .depth = opts.delegate_depth,
     };
@@ -358,9 +424,33 @@ pub fn allTools(
     try list.append(allocator, sp.tool());
 
     if (opts.http_enabled) {
+        // Pushover notification tool (network egress, gated with HTTP tools).
+        const pt = try allocator.create(pushover.PushoverTool);
+        pt.* = .{ .workspace_dir = workspace_dir };
+        try list.append(allocator, pt.tool());
+
         const ht = try allocator.create(http_request.HttpRequestTool);
-        ht.* = .{};
+        ht.* = .{
+            .allowed_domains = opts.http_allowed_domains,
+            .max_response_size = opts.http_max_response_size,
+        };
         try list.append(allocator, ht.tool());
+
+        const wst = try allocator.create(web_search.WebSearchTool);
+        wst.* = .{
+            .searxng_base_url = opts.web_search_base_url,
+            .provider = opts.web_search_provider,
+            .fallback_providers = opts.web_search_fallback_providers,
+            .timeout_secs = opts.http_timeout_secs,
+        };
+        try list.append(allocator, wst.tool());
+
+        const wft = try allocator.create(web_fetch.WebFetchTool);
+        wft.* = .{
+            .default_max_chars = tc.web_fetch_max_chars,
+            .allowed_domains = opts.http_allowed_domains,
+        };
+        try list.append(allocator, wft.tool());
     }
 
     if (opts.browser_enabled) {
@@ -401,9 +491,15 @@ pub fn allTools(
         try list.append(allocator, i2ct.tool());
     }
 
-    // MCP tools (pre-initialized externally)
-    if (opts.mcp_tools) |mt| {
-        for (mt) |t| {
+    // MCP tools — connect to configured servers and register their tools.
+    if (opts.mcp_server_configs.len > 0) {
+        const mcp_tools = mcp_mod.initMcpTools(allocator, opts.mcp_server_configs) catch |err| blk: {
+            std.log.warn("allTools: MCP init failed: {}", .{err});
+            break :blk &[_]Tool{};
+        };
+        // mcp_tools backing slice is a temporary; append each Tool then free it.
+        defer allocator.free(mcp_tools);
+        for (mcp_tools) |t| {
             try list.append(allocator, t);
         }
     }
@@ -457,7 +553,8 @@ pub fn deinitTools(allocator: std.mem.Allocator, tools: []const Tool) void {
 }
 
 /// Create restricted tool set for subagents.
-/// Includes: shell, file_read, file_write, file_edit, git, http (if enabled).
+/// Includes: shell, file_read, file_write, file_edit, file_read_hashed,
+/// file_edit_hashed, git, http (if enabled).
 /// Excludes: message, spawn, delegate, schedule, memory, composio, browser —
 /// to prevent infinite loops and cross-channel side effects.
 pub fn subagentTools(
@@ -465,8 +562,13 @@ pub fn subagentTools(
     workspace_dir: []const u8,
     opts: struct {
         http_enabled: bool = false,
+        http_allowed_domains: []const []const u8 = &.{},
+        http_max_response_size: u32 = 1_000_000,
         allowed_paths: []const []const u8 = &.{},
         policy: ?*const @import("../security/policy.zig").SecurityPolicy = null,
+        tools_config: @import("../config.zig").ToolsConfig = .{},
+        bootstrap_provider: ?bootstrap_mod.BootstrapProvider = null,
+        backend_name: []const u8 = "hybrid",
     },
 ) ![]Tool {
     var list: std.ArrayList(Tool) = .{};
@@ -477,21 +579,72 @@ pub fn subagentTools(
         list.deinit(allocator);
     }
 
+    const tc = opts.tools_config;
+
     const st = try allocator.create(shell.ShellTool);
-    st.* = .{ .workspace_dir = workspace_dir, .allowed_paths = opts.allowed_paths, .policy = opts.policy };
+    st.* = .{
+        .workspace_dir = workspace_dir,
+        .allowed_paths = opts.allowed_paths,
+        .timeout_ns = tc.shell_timeout_secs * std.time.ns_per_s,
+        .max_output_bytes = tc.shell_max_output_bytes,
+        .policy = opts.policy,
+        .path_env_vars = tc.path_env_vars,
+    };
     try list.append(allocator, st.tool());
 
     const ft = try allocator.create(file_read.FileReadTool);
-    ft.* = .{ .workspace_dir = workspace_dir, .allowed_paths = opts.allowed_paths };
+    ft.* = .{
+        .workspace_dir = workspace_dir,
+        .allowed_paths = opts.allowed_paths,
+        .max_file_size = tc.max_file_size_bytes,
+        .bootstrap_provider = opts.bootstrap_provider,
+        .backend_name = opts.backend_name,
+    };
     try list.append(allocator, ft.tool());
 
     const wt = try allocator.create(file_write.FileWriteTool);
-    wt.* = .{ .workspace_dir = workspace_dir, .allowed_paths = opts.allowed_paths };
+    wt.* = .{
+        .workspace_dir = workspace_dir,
+        .allowed_paths = opts.allowed_paths,
+        .bootstrap_provider = opts.bootstrap_provider,
+        .backend_name = opts.backend_name,
+    };
     try list.append(allocator, wt.tool());
 
     const et = try allocator.create(file_edit.FileEditTool);
-    et.* = .{ .workspace_dir = workspace_dir, .allowed_paths = opts.allowed_paths };
+    et.* = .{
+        .workspace_dir = workspace_dir,
+        .allowed_paths = opts.allowed_paths,
+        .max_file_size = tc.max_file_size_bytes,
+        .bootstrap_provider = opts.bootstrap_provider,
+        .backend_name = opts.backend_name,
+    };
     try list.append(allocator, et.tool());
+
+    const dt = try allocator.create(file_delete.FileDeleteTool);
+    dt.* = .{
+        .workspace_dir = workspace_dir,
+        .allowed_paths = opts.allowed_paths,
+        .bootstrap_provider = opts.bootstrap_provider,
+        .backend_name = opts.backend_name,
+    };
+    try list.append(allocator, dt.tool());
+
+    const frh = try allocator.create(file_read_hashed.FileReadHashedTool);
+    frh.* = .{
+        .workspace_dir = workspace_dir,
+        .allowed_paths = opts.allowed_paths,
+        .max_file_size = tc.max_file_size_bytes,
+    };
+    try list.append(allocator, frh.tool());
+
+    const feh = try allocator.create(file_edit_hashed.FileEditHashedTool);
+    feh.* = .{
+        .workspace_dir = workspace_dir,
+        .allowed_paths = opts.allowed_paths,
+        .max_file_size = tc.max_file_size_bytes,
+    };
+    try list.append(allocator, feh.tool());
 
     const gt = try allocator.create(git.GitTool);
     gt.* = .{ .workspace_dir = workspace_dir };
@@ -499,7 +652,10 @@ pub fn subagentTools(
 
     if (opts.http_enabled) {
         const ht = try allocator.create(http_request.HttpRequestTool);
-        ht.* = .{};
+        ht.* = .{
+            .allowed_domains = opts.http_allowed_domains,
+            .max_response_size = opts.http_max_response_size,
+        };
         try list.append(allocator, ht.tool());
     }
 
@@ -651,58 +807,116 @@ test "all tools includes extras when enabled" {
         .http_enabled = true,
         .browser_enabled = true,
     });
-    defer {
-        // Free all heap-allocated tool structs (mix of types)
-        // Order: shell, file_read, file_write, file_edit, git, image_info,
-        //        memory_store, memory_recall, memory_list, memory_forget, delegate, schedule,
-        //        http_request, browser
-        std.testing.allocator.destroy(@as(*shell.ShellTool, @ptrCast(@alignCast(tools[0].ptr))));
-        std.testing.allocator.destroy(@as(*file_read.FileReadTool, @ptrCast(@alignCast(tools[1].ptr))));
-        std.testing.allocator.destroy(@as(*file_write.FileWriteTool, @ptrCast(@alignCast(tools[2].ptr))));
-        std.testing.allocator.destroy(@as(*file_edit.FileEditTool, @ptrCast(@alignCast(tools[3].ptr))));
-        std.testing.allocator.destroy(@as(*git.GitTool, @ptrCast(@alignCast(tools[4].ptr))));
-        std.testing.allocator.destroy(@as(*image.ImageInfoTool, @ptrCast(@alignCast(tools[5].ptr))));
-        std.testing.allocator.destroy(@as(*memory_store.MemoryStoreTool, @ptrCast(@alignCast(tools[6].ptr))));
-        std.testing.allocator.destroy(@as(*memory_recall.MemoryRecallTool, @ptrCast(@alignCast(tools[7].ptr))));
-        std.testing.allocator.destroy(@as(*memory_list.MemoryListTool, @ptrCast(@alignCast(tools[8].ptr))));
-        std.testing.allocator.destroy(@as(*memory_forget.MemoryForgetTool, @ptrCast(@alignCast(tools[9].ptr))));
-        std.testing.allocator.destroy(@as(*delegate.DelegateTool, @ptrCast(@alignCast(tools[10].ptr))));
-        std.testing.allocator.destroy(@as(*schedule.ScheduleTool, @ptrCast(@alignCast(tools[11].ptr))));
-        std.testing.allocator.destroy(@as(*spawn.SpawnTool, @ptrCast(@alignCast(tools[12].ptr))));
-        std.testing.allocator.destroy(@as(*http_request.HttpRequestTool, @ptrCast(@alignCast(tools[13].ptr))));
-        std.testing.allocator.destroy(@as(*browser.BrowserTool, @ptrCast(@alignCast(tools[14].ptr))));
-        std.testing.allocator.free(tools);
-    }
-    // shell + file_read + file_write + file_edit + git + image_info
-    // + memory_store + memory_recall + memory_list + memory_forget
-    // + delegate + schedule + spawn + http_request + browser = 15
-    try std.testing.expectEqual(@as(usize, 15), tools.len);
+    defer deinitTools(std.testing.allocator, tools);
+
+    // Order: shell, file_read, file_write, file_edit, file_delete, file_read_hashed, file_edit_hashed, git, image_info,
+    //        memory_store, memory_recall, memory_list, memory_forget,
+    //        delegate, schedule, spawn, pushover, http_request, web_search,
+    //        web_fetch, browser = 21
+    try std.testing.expectEqual(@as(usize, 21), tools.len);
 }
 
 test "all tools excludes extras when disabled" {
     const tools = try allTools(std.testing.allocator, "/tmp/yc_test", .{});
-    defer {
-        // Free all heap-allocated tool structs
-        // Order: shell, file_read, file_write, file_edit, git, image_info,
-        //        memory_store, memory_recall, memory_list, memory_forget, delegate, schedule, spawn
-        std.testing.allocator.destroy(@as(*shell.ShellTool, @ptrCast(@alignCast(tools[0].ptr))));
-        std.testing.allocator.destroy(@as(*file_read.FileReadTool, @ptrCast(@alignCast(tools[1].ptr))));
-        std.testing.allocator.destroy(@as(*file_write.FileWriteTool, @ptrCast(@alignCast(tools[2].ptr))));
-        std.testing.allocator.destroy(@as(*file_edit.FileEditTool, @ptrCast(@alignCast(tools[3].ptr))));
-        std.testing.allocator.destroy(@as(*git.GitTool, @ptrCast(@alignCast(tools[4].ptr))));
-        std.testing.allocator.destroy(@as(*image.ImageInfoTool, @ptrCast(@alignCast(tools[5].ptr))));
-        std.testing.allocator.destroy(@as(*memory_store.MemoryStoreTool, @ptrCast(@alignCast(tools[6].ptr))));
-        std.testing.allocator.destroy(@as(*memory_recall.MemoryRecallTool, @ptrCast(@alignCast(tools[7].ptr))));
-        std.testing.allocator.destroy(@as(*memory_list.MemoryListTool, @ptrCast(@alignCast(tools[8].ptr))));
-        std.testing.allocator.destroy(@as(*memory_forget.MemoryForgetTool, @ptrCast(@alignCast(tools[9].ptr))));
-        std.testing.allocator.destroy(@as(*delegate.DelegateTool, @ptrCast(@alignCast(tools[10].ptr))));
-        std.testing.allocator.destroy(@as(*schedule.ScheduleTool, @ptrCast(@alignCast(tools[11].ptr))));
-        std.testing.allocator.destroy(@as(*spawn.SpawnTool, @ptrCast(@alignCast(tools[12].ptr))));
-        std.testing.allocator.free(tools);
+    defer deinitTools(std.testing.allocator, tools);
+
+    // Order: shell, file_read, file_write, file_edit, file_delete, file_read_hashed, file_edit_hashed, git, image_info,
+    //        memory_store, memory_recall, memory_list, memory_forget,
+    //        delegate, schedule, spawn = 16
+    try std.testing.expectEqual(@as(usize, 16), tools.len);
+}
+
+test "all tools wires http and web_search config into tool instances" {
+    const domains = [_][]const u8{ "example.com", "api.example.com" };
+    const search_url = "https://searx.example.com";
+    const search_fallbacks = [_][]const u8{ "jina", "duckduckgo" };
+
+    const tools = try allTools(std.testing.allocator, "/tmp/yc_test", .{
+        .http_enabled = true,
+        .http_allowed_domains = &domains,
+        .http_max_response_size = 321_000,
+        .http_timeout_secs = 12,
+        .web_search_base_url = search_url,
+        .web_search_provider = "brave",
+        .web_search_fallback_providers = &search_fallbacks,
+    });
+    defer deinitTools(std.testing.allocator, tools);
+
+    var saw_http = false;
+    var saw_search = false;
+    var saw_fetch = false;
+    for (tools) |t| {
+        if (std.mem.eql(u8, t.name(), "http_request")) {
+            const ht: *http_request.HttpRequestTool = @ptrCast(@alignCast(t.ptr));
+            try std.testing.expectEqual(@as(usize, 2), ht.allowed_domains.len);
+            try std.testing.expectEqualStrings("example.com", ht.allowed_domains[0]);
+            try std.testing.expectEqual(@as(u32, 321_000), ht.max_response_size);
+            saw_http = true;
+            continue;
+        }
+        if (std.mem.eql(u8, t.name(), "web_search")) {
+            const wst: *web_search.WebSearchTool = @ptrCast(@alignCast(t.ptr));
+            try std.testing.expectEqualStrings(search_url, wst.searxng_base_url.?);
+            try std.testing.expectEqualStrings("brave", wst.provider);
+            try std.testing.expectEqual(@as(usize, 2), wst.fallback_providers.len);
+            try std.testing.expectEqualStrings("jina", wst.fallback_providers[0]);
+            try std.testing.expectEqual(@as(u64, 12), wst.timeout_secs);
+            saw_search = true;
+            continue;
+        }
+        if (std.mem.eql(u8, t.name(), "web_fetch")) {
+            const wft: *web_fetch.WebFetchTool = @ptrCast(@alignCast(t.ptr));
+            try std.testing.expectEqual(@as(usize, 2), wft.allowed_domains.len);
+            try std.testing.expectEqualStrings("example.com", wft.allowed_domains[0]);
+            saw_fetch = true;
+        }
     }
-    // shell + file_read + file_write + file_edit + git + image_info
-    // + memory_store + memory_recall + memory_list + memory_forget + delegate + schedule + spawn = 13
-    try std.testing.expectEqual(@as(usize, 13), tools.len);
+
+    try std.testing.expect(saw_http);
+    try std.testing.expect(saw_search);
+    try std.testing.expect(saw_fetch);
+}
+
+test "all tools wire bootstrap provider into file_read for sqlite backends" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const ws_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(ws_path);
+
+    var lru = memory_mod.InMemoryLruMemory.init(std.testing.allocator, 16);
+    defer lru.deinit();
+    var bp_impl = bootstrap_mod.MemoryBootstrapProvider.init(std.testing.allocator, lru.memory(), ws_path);
+    const provider = bp_impl.provider();
+    try provider.store("USER.md", "name: Igor");
+
+    const tools = try allTools(std.testing.allocator, ws_path, .{
+        .allowed_paths = &.{ws_path},
+        .bootstrap_provider = provider,
+        .backend_name = "sqlite",
+    });
+    defer deinitTools(std.testing.allocator, tools);
+
+    var checked = false;
+    for (tools) |t| {
+        if (!std.mem.eql(u8, t.name(), "file_read")) continue;
+        const ft: *file_read.FileReadTool = @ptrCast(@alignCast(t.ptr));
+        try std.testing.expect(ft.bootstrap_provider != null);
+        try std.testing.expectEqualStrings("sqlite", ft.backend_name);
+
+        const parsed = try parseTestArgs("{\"path\": \"USER.md\"}");
+        defer parsed.deinit();
+        const result = try t.execute(std.testing.allocator, parsed.value.object);
+        defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+        defer if (result.error_msg) |e| std.testing.allocator.free(e);
+
+        try std.testing.expect(result.success);
+        try std.testing.expectEqualStrings("name: Igor", result.output);
+        checked = true;
+        break;
+    }
+
+    try std.testing.expect(checked);
 }
 
 test "all tools wires subagent manager into spawn tool" {
@@ -731,6 +945,117 @@ test "all tools wires subagent manager into spawn tool" {
         break;
     }
     try std.testing.expect(checked_spawn);
+}
+
+test "subagent tools use configured shell and file limits" {
+    const tools = try subagentTools(std.testing.allocator, "/tmp/yc_test", .{
+        .tools_config = .{
+            .shell_timeout_secs = 7,
+            .shell_max_output_bytes = 2048,
+            .max_file_size_bytes = 4096,
+        },
+    });
+    defer deinitTools(std.testing.allocator, tools);
+
+    var saw_shell = false;
+    var saw_file_read = false;
+    var saw_file_edit = false;
+    var saw_file_read_hashed = false;
+    var saw_file_edit_hashed = false;
+    for (tools) |t| {
+        if (std.mem.eql(u8, t.name(), "shell")) {
+            const st: *shell.ShellTool = @ptrCast(@alignCast(t.ptr));
+            try std.testing.expectEqual(@as(u64, 7 * std.time.ns_per_s), st.timeout_ns);
+            try std.testing.expectEqual(@as(usize, 2048), st.max_output_bytes);
+            saw_shell = true;
+            continue;
+        }
+        if (std.mem.eql(u8, t.name(), "file_read")) {
+            const ft: *file_read.FileReadTool = @ptrCast(@alignCast(t.ptr));
+            try std.testing.expectEqual(@as(u64, 4096), ft.max_file_size);
+            saw_file_read = true;
+            continue;
+        }
+        if (std.mem.eql(u8, t.name(), "file_edit")) {
+            const et: *file_edit.FileEditTool = @ptrCast(@alignCast(t.ptr));
+            try std.testing.expectEqual(@as(usize, 4096), et.max_file_size);
+            saw_file_edit = true;
+            continue;
+        }
+        if (std.mem.eql(u8, t.name(), "file_read_hashed")) {
+            const ft: *file_read_hashed.FileReadHashedTool = @ptrCast(@alignCast(t.ptr));
+            try std.testing.expectEqual(@as(u64, 4096), ft.max_file_size);
+            saw_file_read_hashed = true;
+            continue;
+        }
+        if (std.mem.eql(u8, t.name(), "file_edit_hashed")) {
+            const et: *file_edit_hashed.FileEditHashedTool = @ptrCast(@alignCast(t.ptr));
+            try std.testing.expectEqual(@as(usize, 4096), et.max_file_size);
+            saw_file_edit_hashed = true;
+        }
+    }
+
+    try std.testing.expect(saw_shell);
+    try std.testing.expect(saw_file_read);
+    try std.testing.expect(saw_file_edit);
+    try std.testing.expect(saw_file_read_hashed);
+    try std.testing.expect(saw_file_edit_hashed);
+}
+
+test "subagent tools wire bootstrap provider into file_read for sqlite backends" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const ws_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(ws_path);
+
+    var lru = memory_mod.InMemoryLruMemory.init(std.testing.allocator, 16);
+    defer lru.deinit();
+    var bp_impl = bootstrap_mod.MemoryBootstrapProvider.init(std.testing.allocator, lru.memory(), ws_path);
+    const provider = bp_impl.provider();
+    try provider.store("SOUL.md", "## Soul");
+
+    const tools = try subagentTools(std.testing.allocator, ws_path, .{
+        .allowed_paths = &.{ws_path},
+        .bootstrap_provider = provider,
+        .backend_name = "sqlite",
+    });
+    defer deinitTools(std.testing.allocator, tools);
+
+    var checked = false;
+    for (tools) |t| {
+        if (!std.mem.eql(u8, t.name(), "file_read")) continue;
+        const ft: *file_read.FileReadTool = @ptrCast(@alignCast(t.ptr));
+        try std.testing.expect(ft.bootstrap_provider != null);
+        try std.testing.expectEqualStrings("sqlite", ft.backend_name);
+        checked = true;
+        break;
+    }
+
+    try std.testing.expect(checked);
+}
+
+test "subagent tools wire http allowlist and response limit" {
+    const domains = [_][]const u8{"example.com"};
+    const tools = try subagentTools(std.testing.allocator, "/tmp/yc_test", .{
+        .http_enabled = true,
+        .http_allowed_domains = &domains,
+        .http_max_response_size = 2222,
+    });
+    defer deinitTools(std.testing.allocator, tools);
+
+    var saw_http = false;
+    for (tools) |t| {
+        if (!std.mem.eql(u8, t.name(), "http_request")) continue;
+        const ht: *http_request.HttpRequestTool = @ptrCast(@alignCast(t.ptr));
+        try std.testing.expectEqual(@as(usize, 1), ht.allowed_domains.len);
+        try std.testing.expectEqualStrings("example.com", ht.allowed_domains[0]);
+        try std.testing.expectEqual(@as(u32, 2222), ht.max_response_size);
+        saw_http = true;
+        break;
+    }
+
+    try std.testing.expect(saw_http);
 }
 
 test "bindMemoryTools matches by vtable, not by colliding tool name" {

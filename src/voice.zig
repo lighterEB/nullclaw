@@ -1,7 +1,7 @@
-//! Voice transcription via Groq Whisper API (OpenAI-compatible).
+//! Voice transcription via OpenAI-compatible STT APIs (Groq/OpenAI/Telnyx).
 //!
 //! Reads an audio file, builds a multipart/form-data POST request,
-//! and sends it to the Groq transcription endpoint. Returns the
+//! and sends it to the configured transcription endpoint. Returns the
 //! transcribed text as an owned slice.
 
 const std = @import("std");
@@ -76,6 +76,7 @@ pub fn resolveTranscriptionEndpoint(provider: []const u8, explicit_endpoint: ?[]
     if (explicit_endpoint) |ep| return ep;
     if (std.mem.eql(u8, provider, "openai")) return "https://api.openai.com/v1/audio/transcriptions";
     if (std.mem.eql(u8, provider, "groq")) return "https://api.groq.com/openai/v1/audio/transcriptions";
+    if (std.mem.eql(u8, provider, "telnyx")) return "https://api.telnyx.com/v2/ai/audio/transcriptions";
     // For unknown providers, try OpenAI-compatible endpoint
     return "https://api.groq.com/openai/v1/audio/transcriptions";
 }
@@ -591,5 +592,12 @@ test "voice resolveTranscriptionEndpoint unknown falls back to groq" {
     try std.testing.expectEqualStrings(
         "https://api.groq.com/openai/v1/audio/transcriptions",
         resolveTranscriptionEndpoint("some-unknown-provider", null),
+    );
+}
+
+test "voice resolveTranscriptionEndpoint telnyx" {
+    try std.testing.expectEqualStrings(
+        "https://api.telnyx.com/v2/ai/audio/transcriptions",
+        resolveTranscriptionEndpoint("telnyx", null),
     );
 }

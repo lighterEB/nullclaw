@@ -1,11 +1,25 @@
-//! Web Search Tool — internet search via Brave Search API.
+//! Web Search Tool — internet search across multiple providers.
 //!
-//! Provides web search capability for the agent. Requires BRAVE_API_KEY
-//! environment variable (free tier available at https://brave.com/search/api/).
+//! Supported providers:
+//!   - searxng
+//!   - duckduckgo (ddg)
+//!   - brave
+//!   - firecrawl
+//!   - tavily
+//!   - perplexity
+//!   - exa
+//!   - jina
+//!
+//! Provider selection:
+//! 1) `provider = "auto"` (default): tries a built-in chain.
+//! 2) Explicit provider via config (`http_request.search_provider`) or tool arg (`provider`).
+//! 3) Optional fallback chain (`http_request.search_fallback_providers`).
 
 const std = @import("std");
 const root = @import("root.zig");
 const platform = @import("../platform.zig");
+const search_providers = @import("web_search_providers/root.zig");
+const search_common = search_providers.common;
 const Tool = root.Tool;
 const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
@@ -14,13 +28,39 @@ const JsonObjectMap = root.JsonObjectMap;
 const MAX_RESULTS: usize = 10;
 /// Default number of search results.
 const DEFAULT_COUNT: usize = 5;
+/// Default request timeout for backend HTTP calls.
+const DEFAULT_TIMEOUT_SECS: u64 = 30;
+/// Upper bound for provider chain size (primary + fallbacks + auto expansions).
+const MAX_PROVIDER_CHAIN: usize = 16;
 
-/// Web search tool using Brave Search API.
+const SearchProvider = enum {
+    auto,
+    searxng,
+    duckduckgo,
+    brave,
+    firecrawl,
+    tavily,
+    perplexity,
+    exa,
+    jina,
+};
+
+const ProviderSearchError = search_common.ProviderSearchError;
+
+/// Web search tool supporting multiple providers.
 pub const WebSearchTool = struct {
+    /// Optional SearXNG base URL (HTTPS anywhere, or local/private HTTP).
+    searxng_base_url: ?[]const u8 = null,
+    /// Primary provider ("auto" by default).
+    provider: []const u8 = "auto",
+    /// Fallback providers tried in order when primary fails.
+    fallback_providers: []const []const u8 = &.{},
+    timeout_secs: u64 = DEFAULT_TIMEOUT_SECS,
+
     pub const tool_name = "web_search";
-    pub const tool_description = "Search the web using Brave Search API. Returns titles, URLs, and descriptions. Requires BRAVE_API_KEY env var.";
+    pub const tool_description = "Search the web. Providers: searxng, duckduckgo(ddg), brave, firecrawl, tavily, perplexity, exa, jina. Configure via http_request.search_provider/search_fallback_providers and API key env vars.";
     pub const tool_params =
-        \\{"type":"object","properties":{"query":{"type":"string","minLength":1,"description":"Search query"},"count":{"type":"integer","minimum":1,"maximum":10,"default":5,"description":"Number of results (1-10)"}},"required":["query"]}
+        \\{"type":"object","properties":{"query":{"type":"string","minLength":1,"description":"Search query"},"count":{"type":"integer","minimum":1,"maximum":10,"default":5,"description":"Number of results (1-10)"},"provider":{"type":"string","description":"Optional provider override (auto,searxng,duckduckgo,ddg,brave,firecrawl,tavily,perplexity,exa,jina)"}},"required":["query"]}
     ;
 
     const vtable = root.ToolVTable(@This());
@@ -32,7 +72,7 @@ pub const WebSearchTool = struct {
         };
     }
 
-    pub fn execute(_: *WebSearchTool, allocator: std.mem.Allocator, args: JsonObjectMap) !ToolResult {
+    pub fn execute(self: *WebSearchTool, allocator: std.mem.Allocator, args: JsonObjectMap) !ToolResult {
         const query = root.getString(args, "query") orelse
             return ToolResult.fail("Missing required 'query' parameter");
 
@@ -40,77 +80,174 @@ pub const WebSearchTool = struct {
             return ToolResult.fail("'query' must not be empty");
 
         const count = parseCount(args);
+        const provider_raw = root.getString(args, "provider") orelse self.provider;
 
-        // Get API key from environment
-        const api_key = platform.getEnvOrNull(allocator, "BRAVE_API_KEY") orelse
-            return ToolResult.fail("BRAVE_API_KEY environment variable not set. Get a free key at https://brave.com/search/api/");
-        defer allocator.free(api_key);
-
-        if (api_key.len == 0)
-            return ToolResult.fail("BRAVE_API_KEY is empty");
-
-        // URL-encode query
-        const encoded_query = try urlEncode(allocator, query);
-        defer allocator.free(encoded_query);
-
-        // Build URL
-        const url_str = try std.fmt.allocPrint(
-            allocator,
-            "https://api.search.brave.com/res/v1/web/search?q={s}&count={d}",
-            .{ encoded_query, count },
-        );
-        defer allocator.free(url_str);
-
-        // Make HTTP request
-        var client: std.http.Client = .{ .allocator = allocator };
-        defer client.deinit();
-
-        const uri = std.Uri.parse(url_str) catch
-            return ToolResult.fail("Failed to parse search URL");
-
-        var req = client.request(.GET, uri, .{
-            .extra_headers = &.{
-                .{ .name = "X-Subscription-Token", .value = api_key },
-                .{ .name = "Accept", .value = "application/json" },
-            },
-        }) catch |err| {
-            const msg = try std.fmt.allocPrint(allocator, "Search request failed: {}", .{err});
-            return ToolResult{ .success = false, .output = "", .error_msg = msg };
-        };
-        defer req.deinit();
-
-        req.sendBodiless() catch |err| {
-            const msg = try std.fmt.allocPrint(allocator, "Failed to send search request: {}", .{err});
-            return ToolResult{ .success = false, .output = "", .error_msg = msg };
+        var chain_buf: [MAX_PROVIDER_CHAIN]SearchProvider = undefined;
+        const chain = buildProviderChain(self, provider_raw, &chain_buf) catch |err| switch (err) {
+            error.InvalidProvider => return ToolResult.fail("Invalid web_search provider. Supported: auto, searxng, duckduckgo(ddg), brave, firecrawl, tavily, perplexity, exa, jina."),
+            else => return err,
         };
 
-        var redirect_buf: [4096]u8 = undefined;
-        var response = req.receiveHead(&redirect_buf) catch |err| {
-            const msg = try std.fmt.allocPrint(allocator, "Failed to receive response: {}", .{err});
-            return ToolResult{ .success = false, .output = "", .error_msg = msg };
-        };
+        var failures: std.ArrayList(u8) = .empty;
+        defer failures.deinit(allocator);
 
-        const status_code = @intFromEnum(response.head.status);
-        if (status_code != 200) {
-            const msg = try std.fmt.allocPrint(allocator, "Brave Search API returned HTTP {d}", .{status_code});
-            return ToolResult{ .success = false, .output = "", .error_msg = msg };
+        for (chain) |provider| {
+            const result = executeWithProvider(self, allocator, provider, query, count) catch |err| {
+                if (err == error.InvalidSearchBaseUrl) {
+                    return ToolResult.fail("Invalid http_request.search_base_url; expected https://host[/search] or local http://host[:port][/search]");
+                }
+
+                if (failures.items.len > 0) {
+                    try failures.appendSlice(allocator, " | ");
+                }
+                try std.fmt.format(failures.writer(allocator), "{s}:{s}", .{ providerName(provider), @errorName(err) });
+                continue;
+            };
+            return result;
         }
 
-        // Read response body
-        var transfer_buf: [8192]u8 = undefined;
-        const reader = response.reader(&transfer_buf);
-        const body = reader.readAlloc(allocator, 512 * 1024) catch |err| {
-            const msg = try std.fmt.allocPrint(allocator, "Failed to read response: {}", .{err});
-            return ToolResult{ .success = false, .output = "", .error_msg = msg };
-        };
-        defer allocator.free(body);
+        if (failures.items.len == 0) {
+            return ToolResult.fail("web_search has no providers configured.");
+        }
 
-        // Parse JSON response and format results
-        return formatBraveResults(allocator, body, query);
+        const msg = try std.fmt.allocPrint(allocator, "All web_search providers failed: {s}", .{failures.items});
+        return ToolResult{ .success = false, .output = "", .error_msg = msg };
     }
 };
 
-/// Parse count from args ObjectMap. Returns DEFAULT_COUNT if not found or invalid.
+fn parseProvider(raw: []const u8) ?SearchProvider {
+    const trimmed = std.mem.trim(u8, raw, " \t\n\r");
+    if (std.ascii.eqlIgnoreCase(trimmed, "auto")) return .auto;
+    if (std.ascii.eqlIgnoreCase(trimmed, "searxng")) return .searxng;
+    if (std.ascii.eqlIgnoreCase(trimmed, "duckduckgo") or std.ascii.eqlIgnoreCase(trimmed, "ddg")) return .duckduckgo;
+    if (std.ascii.eqlIgnoreCase(trimmed, "brave")) return .brave;
+    if (std.ascii.eqlIgnoreCase(trimmed, "firecrawl")) return .firecrawl;
+    if (std.ascii.eqlIgnoreCase(trimmed, "tavily")) return .tavily;
+    if (std.ascii.eqlIgnoreCase(trimmed, "perplexity")) return .perplexity;
+    if (std.ascii.eqlIgnoreCase(trimmed, "exa")) return .exa;
+    if (std.ascii.eqlIgnoreCase(trimmed, "jina")) return .jina;
+    return null;
+}
+
+fn providerName(provider: SearchProvider) []const u8 {
+    return switch (provider) {
+        .auto => "auto",
+        .searxng => "searxng",
+        .duckduckgo => "duckduckgo",
+        .brave => "brave",
+        .firecrawl => "firecrawl",
+        .tavily => "tavily",
+        .perplexity => "perplexity",
+        .exa => "exa",
+        .jina => "jina",
+    };
+}
+
+fn appendProviderUnique(chain: []SearchProvider, len: *usize, provider: SearchProvider) void {
+    for (chain[0..len.*]) |existing| {
+        if (existing == provider) return;
+    }
+    if (len.* < chain.len) {
+        chain[len.*] = provider;
+        len.* += 1;
+    }
+}
+
+fn buildProviderChain(
+    self: *WebSearchTool,
+    primary_raw: []const u8,
+    chain_buf: *[MAX_PROVIDER_CHAIN]SearchProvider,
+) ProviderSearchError![]const SearchProvider {
+    var len: usize = 0;
+
+    const primary = parseProvider(primary_raw) orelse return error.InvalidProvider;
+    if (primary == .auto) {
+        if (self.searxng_base_url) |base_url| {
+            if (std.mem.trim(u8, base_url, " \t\n\r").len > 0) {
+                appendProviderUnique(chain_buf, &len, .searxng);
+            }
+        }
+        appendProviderUnique(chain_buf, &len, .brave);
+        appendProviderUnique(chain_buf, &len, .firecrawl);
+        appendProviderUnique(chain_buf, &len, .tavily);
+        appendProviderUnique(chain_buf, &len, .perplexity);
+        appendProviderUnique(chain_buf, &len, .exa);
+        appendProviderUnique(chain_buf, &len, .jina);
+        appendProviderUnique(chain_buf, &len, .duckduckgo);
+    } else {
+        appendProviderUnique(chain_buf, &len, primary);
+    }
+
+    for (self.fallback_providers) |raw| {
+        const fallback = parseProvider(raw) orelse return error.InvalidProvider;
+        if (fallback == .auto) return error.InvalidProvider;
+        appendProviderUnique(chain_buf, &len, fallback);
+    }
+
+    return chain_buf[0..len];
+}
+
+fn executeWithProvider(
+    self: *WebSearchTool,
+    allocator: std.mem.Allocator,
+    provider: SearchProvider,
+    query: []const u8,
+    count: usize,
+) (ProviderSearchError || error{OutOfMemory})!ToolResult {
+    switch (provider) {
+        .auto => return error.InvalidProvider,
+        .searxng => {
+            const base_url = self.searxng_base_url orelse return error.ProviderUnavailable;
+            const trimmed = std.mem.trim(u8, base_url, " \t\n\r");
+            if (trimmed.len == 0) return error.ProviderUnavailable;
+            return search_providers.searxng.execute(allocator, query, count, trimmed, self.timeout_secs);
+        },
+        .duckduckgo => return search_providers.duckduckgo.execute(allocator, query, count, self.timeout_secs),
+        .brave => {
+            const api_key = tryApiKeyFromEnvOrNull(allocator, &.{"BRAVE_API_KEY"}) orelse return error.MissingApiKey;
+            defer allocator.free(api_key);
+            return search_providers.brave.execute(allocator, query, count, api_key, self.timeout_secs);
+        },
+        .firecrawl => {
+            const api_key = tryApiKeyFromEnvOrNull(allocator, &.{ "FIRECRAWL_API_KEY", "WEB_SEARCH_API_KEY" }) orelse return error.MissingApiKey;
+            defer allocator.free(api_key);
+            return search_providers.firecrawl.execute(allocator, query, count, api_key, self.timeout_secs);
+        },
+        .tavily => {
+            const api_key = tryApiKeyFromEnvOrNull(allocator, &.{ "TAVILY_API_KEY", "WEB_SEARCH_API_KEY" }) orelse return error.MissingApiKey;
+            defer allocator.free(api_key);
+            return search_providers.tavily.execute(allocator, query, count, api_key, self.timeout_secs);
+        },
+        .perplexity => {
+            const api_key = tryApiKeyFromEnvOrNull(allocator, &.{ "PERPLEXITY_API_KEY", "WEB_SEARCH_API_KEY" }) orelse return error.MissingApiKey;
+            defer allocator.free(api_key);
+            return search_providers.perplexity.execute(allocator, query, count, api_key, self.timeout_secs);
+        },
+        .exa => {
+            const api_key = tryApiKeyFromEnvOrNull(allocator, &.{ "EXA_API_KEY", "WEB_SEARCH_API_KEY" }) orelse return error.MissingApiKey;
+            defer allocator.free(api_key);
+            return search_providers.exa.execute(allocator, query, count, api_key, self.timeout_secs);
+        },
+        .jina => {
+            const api_key = tryApiKeyFromEnvOrNull(allocator, &.{ "JINA_API_KEY", "WEB_SEARCH_API_KEY" }) orelse return error.MissingApiKey;
+            defer allocator.free(api_key);
+            return search_providers.jina.execute(allocator, query, api_key, self.timeout_secs);
+        },
+    }
+}
+
+fn tryApiKeyFromEnvOrNull(allocator: std.mem.Allocator, names: []const []const u8) ?[]const u8 {
+    for (names) |name| {
+        const key = platform.getEnvOrNull(allocator, name) orelse continue;
+        if (std.mem.trim(u8, key, " \t\n\r").len == 0) {
+            allocator.free(key);
+            continue;
+        }
+        return key;
+    }
+    return null;
+}
+
 fn parseCount(args: JsonObjectMap) usize {
     const val_i64 = root.getInt(args, "count") orelse return DEFAULT_COUNT;
     if (val_i64 < 1) return 1;
@@ -118,89 +255,33 @@ fn parseCount(args: JsonObjectMap) usize {
     return val;
 }
 
-/// URL-encode a string (percent-encoding).
 pub fn urlEncode(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
-    var buf: std.ArrayList(u8) = .empty;
-    errdefer buf.deinit(allocator);
-    for (input) |c| {
-        if (std.ascii.isAlphanumeric(c) or c == '-' or c == '_' or c == '.' or c == '~') {
-            try buf.append(allocator, c);
-        } else if (c == ' ') {
-            try buf.append(allocator, '+');
-        } else {
-            try buf.appendSlice(allocator, &.{ '%', hexDigit(c >> 4), hexDigit(c & 0x0f) });
-        }
-    }
-    return buf.toOwnedSlice(allocator);
+    return search_common.urlEncode(allocator, input);
 }
 
-fn hexDigit(v: u8) u8 {
-    return "0123456789ABCDEF"[v & 0x0f];
+fn urlEncodePath(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+    return search_common.urlEncodePath(allocator, input);
 }
 
-/// Parse Brave Search JSON and format as text results.
+fn buildSearxngSearchUrl(
+    allocator: std.mem.Allocator,
+    base_url: []const u8,
+    encoded_query: []const u8,
+    count: usize,
+) ![]u8 {
+    return search_common.buildSearxngSearchUrl(allocator, base_url, encoded_query, count);
+}
+
 pub fn formatBraveResults(allocator: std.mem.Allocator, json_body: []const u8, query: []const u8) !ToolResult {
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_body, .{}) catch
-        return ToolResult.fail("Failed to parse search response JSON");
-    defer parsed.deinit();
-
-    const root_val = switch (parsed.value) {
-        .object => |o| o,
-        else => return ToolResult.fail("Unexpected search response format"),
-    };
-
-    // Extract web results
-    const web = root_val.get("web") orelse
-        return ToolResult.ok("No web results found.");
-
-    const web_obj = switch (web) {
-        .object => |o| o,
-        else => return ToolResult.ok("No web results found."),
-    };
-
-    const results = web_obj.get("results") orelse
-        return ToolResult.ok("No web results found.");
-
-    const results_arr = switch (results) {
-        .array => |a| a,
-        else => return ToolResult.ok("No web results found."),
-    };
-
-    if (results_arr.items.len == 0)
-        return ToolResult.ok("No web results found.");
-
-    // Format results
-    var buf: std.ArrayList(u8) = .empty;
-    errdefer buf.deinit(allocator);
-
-    try std.fmt.format(buf.writer(allocator), "Results for: {s}\n\n", .{query});
-
-    for (results_arr.items, 0..) |item, i| {
-        const obj = switch (item) {
-            .object => |o| o,
-            else => continue,
-        };
-
-        const title = extractString(obj, "title") orelse "(no title)";
-        const url = extractString(obj, "url") orelse "(no url)";
-        const desc = extractString(obj, "description") orelse "";
-
-        try std.fmt.format(buf.writer(allocator), "{d}. {s}\n   {s}\n", .{ i + 1, title, url });
-        if (desc.len > 0) {
-            try std.fmt.format(buf.writer(allocator), "   {s}\n", .{desc});
-        }
-        try buf.append(allocator, '\n');
-    }
-
-    return ToolResult.ok(try buf.toOwnedSlice(allocator));
+    return search_providers.brave.formatResults(allocator, json_body, query);
 }
 
-fn extractString(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
-    const val = obj.get(key) orelse return null;
-    return switch (val) {
-        .string => |s| s,
-        else => null,
-    };
+pub fn formatSearxngResults(allocator: std.mem.Allocator, json_body: []const u8, query: []const u8) !ToolResult {
+    return search_providers.searxng.formatResults(allocator, json_body, query);
+}
+
+fn formatDuckDuckGoResults(allocator: std.mem.Allocator, json_body: []const u8, query: []const u8, count: usize) !ToolResult {
+    return search_providers.duckduckgo.formatResults(allocator, json_body, query, count);
 }
 
 // ══════════════════════════════════════════════════════════════════
@@ -235,19 +316,51 @@ test "WebSearchTool empty query fails" {
     try testing.expectEqualStrings("'query' must not be empty", result.error_msg.?);
 }
 
-test "WebSearchTool no API key fails with helpful message" {
-    // This test relies on BRAVE_API_KEY not being set in test env
-    // If it is set, the test would try to make a real request
-    if (platform.getEnvOrNull(testing.allocator, "BRAVE_API_KEY")) |k| {
-        testing.allocator.free(k);
-        return;
-    }
+test "WebSearchTool without working provider chain returns aggregate error" {
     var wst = WebSearchTool{};
     const parsed = try root.parseTestArgs("{\"query\":\"zig programming\"}");
     defer parsed.deinit();
     const result = try wst.execute(testing.allocator, parsed.value.object);
+    defer if (result.error_msg) |e| testing.allocator.free(e);
     try testing.expect(!result.success);
-    try testing.expect(std.mem.indexOf(u8, result.error_msg.?, "BRAVE_API_KEY") != null);
+    try testing.expect(std.mem.indexOf(u8, result.error_msg.?, "All web_search providers failed") != null);
+}
+
+test "WebSearchTool invalid searxng URL reports config error" {
+    var wst = WebSearchTool{ .searxng_base_url = "https://searx.example.com?bad=1", .provider = "searxng" };
+    const parsed = try root.parseTestArgs("{\"query\":\"zig\"}");
+    defer parsed.deinit();
+    const result = try wst.execute(testing.allocator, parsed.value.object);
+    try testing.expect(!result.success);
+    try testing.expect(std.mem.indexOf(u8, result.error_msg.?, "Invalid http_request.search_base_url") != null);
+}
+
+test "parseProvider accepts aliases" {
+    try testing.expectEqual(SearchProvider.duckduckgo, parseProvider("ddg").?);
+    try testing.expectEqual(SearchProvider.duckduckgo, parseProvider("duckduckgo").?);
+    try testing.expectEqual(SearchProvider.brave, parseProvider("BRAVE").?);
+    try testing.expect(parseProvider("google") == null);
+}
+
+test "buildProviderChain auto includes searxng when configured" {
+    const fallbacks = [_][]const u8{"duckduckgo"};
+    var wst = WebSearchTool{
+        .searxng_base_url = "https://searx.example.com",
+        .provider = "auto",
+        .fallback_providers = &fallbacks,
+    };
+
+    var chain_buf: [MAX_PROVIDER_CHAIN]SearchProvider = undefined;
+    const chain = try buildProviderChain(&wst, "auto", &chain_buf);
+    try testing.expect(chain.len > 0);
+    try testing.expectEqual(SearchProvider.searxng, chain[0]);
+}
+
+test "buildProviderChain rejects invalid fallback provider" {
+    const fallbacks = [_][]const u8{"unknown"};
+    var wst = WebSearchTool{ .fallback_providers = &fallbacks };
+    var chain_buf: [MAX_PROVIDER_CHAIN]SearchProvider = undefined;
+    try testing.expectError(error.InvalidProvider, buildProviderChain(&wst, "auto", &chain_buf));
 }
 
 test "parseCount defaults to 5" {
@@ -289,6 +402,47 @@ test "urlEncode passthrough" {
     try testing.expectEqualStrings("simple-test_123.txt~", encoded);
 }
 
+test "urlEncodePath encodes spaces as percent" {
+    const encoded = try urlEncodePath(testing.allocator, "hello world");
+    defer testing.allocator.free(encoded);
+    try testing.expectEqualStrings("hello%20world", encoded);
+}
+
+test "buildSearxngSearchUrl normalizes base URLs" {
+    const encoded_query = "zig+lang";
+
+    const from_root = try buildSearxngSearchUrl(testing.allocator, "https://searx.example.com/", encoded_query, 3);
+    defer testing.allocator.free(from_root);
+    try testing.expect(std.mem.indexOf(u8, from_root, "https://searx.example.com/search?") != null);
+
+    const from_search = try buildSearxngSearchUrl(testing.allocator, "https://searx.example.com/search", encoded_query, 3);
+    defer testing.allocator.free(from_search);
+    try testing.expect(std.mem.indexOf(u8, from_search, "https://searx.example.com/search?") != null);
+
+    const from_local_http = try buildSearxngSearchUrl(testing.allocator, "http://localhost:8888/", encoded_query, 3);
+    defer testing.allocator.free(from_local_http);
+    try testing.expect(std.mem.indexOf(u8, from_local_http, "http://localhost:8888/search?") != null);
+}
+
+test "buildSearxngSearchUrl rejects query and fragment" {
+    try testing.expectError(
+        error.InvalidSearchBaseUrl,
+        buildSearxngSearchUrl(testing.allocator, "https://searx.example.com?x=1", "zig", 3),
+    );
+    try testing.expectError(
+        error.InvalidSearchBaseUrl,
+        buildSearxngSearchUrl(testing.allocator, "https://searx.example.com#frag", "zig", 3),
+    );
+    try testing.expectError(
+        error.InvalidSearchBaseUrl,
+        buildSearxngSearchUrl(testing.allocator, "https://searx.example.com/custom", "zig", 3),
+    );
+    try testing.expectError(
+        error.InvalidSearchBaseUrl,
+        buildSearxngSearchUrl(testing.allocator, "http://searx.example.com", "zig", 3),
+    );
+}
+
 test "formatBraveResults parses valid JSON" {
     const json =
         \\{"web":{"results":[
@@ -305,6 +459,42 @@ test "formatBraveResults parses valid JSON" {
     try testing.expect(std.mem.indexOf(u8, result.output, "2. Zig GitHub") != null);
 }
 
+test "formatSearxngResults parses valid JSON" {
+    const json =
+        \\{"results":[
+        \\  {"title":"SearXNG","url":"https://docs.searxng.org","content":"Privacy-respecting metasearch."},
+        \\  {"title":"Zig","url":"https://ziglang.org","content":"General-purpose programming language."}
+        \\]}
+    ;
+    const result = try formatSearxngResults(testing.allocator, json, "zig privacy search");
+    defer testing.allocator.free(result.output);
+    try testing.expect(result.success);
+    try testing.expect(std.mem.indexOf(u8, result.output, "Results for: zig privacy search") != null);
+    try testing.expect(std.mem.indexOf(u8, result.output, "1. SearXNG") != null);
+    try testing.expect(std.mem.indexOf(u8, result.output, "https://docs.searxng.org") != null);
+}
+
+test "formatDuckDuckGoResults parses related topics" {
+    const json =
+        \\{
+        \\  "Heading": "Zig",
+        \\  "AbstractText": "",
+        \\  "AbstractURL": "",
+        \\  "RelatedTopics": [
+        \\    {"Text": "Zig - Programming language", "FirstURL": "https://ziglang.org"},
+        \\    {"Topics": [
+        \\      {"Text": "Ziglang docs - Official docs", "FirstURL": "https://ziglang.org/documentation/master/"}
+        \\    ]}
+        \\  ]
+        \\}
+    ;
+    const result = try formatDuckDuckGoResults(testing.allocator, json, "zig", 5);
+    defer testing.allocator.free(result.output);
+    try testing.expect(result.success);
+    try testing.expect(std.mem.indexOf(u8, result.output, "1. Zig") != null);
+    try testing.expect(std.mem.indexOf(u8, result.output, "https://ziglang.org") != null);
+}
+
 test "formatBraveResults empty results" {
     const json = "{\"web\":{\"results\":[]}}";
     const result = try formatBraveResults(testing.allocator, json, "nothing");
@@ -312,14 +502,19 @@ test "formatBraveResults empty results" {
     try testing.expectEqualStrings("No web results found.", result.output);
 }
 
-test "formatBraveResults no web key" {
-    const json = "{\"query\":{\"original\":\"test\"}}";
-    const result = try formatBraveResults(testing.allocator, json, "test");
+test "formatSearxngResults empty results" {
+    const json = "{\"results\":[]}";
+    const result = try formatSearxngResults(testing.allocator, json, "nothing");
     try testing.expect(result.success);
     try testing.expectEqualStrings("No web results found.", result.output);
 }
 
 test "formatBraveResults invalid JSON" {
     const result = try formatBraveResults(testing.allocator, "not json", "q");
+    try testing.expect(!result.success);
+}
+
+test "formatSearxngResults invalid JSON" {
+    const result = try formatSearxngResults(testing.allocator, "not json", "q");
     try testing.expect(!result.success);
 }

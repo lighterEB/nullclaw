@@ -4,6 +4,7 @@
 //! Extracted from file_edit.zig to eliminate cross-imports between tool files.
 
 const std = @import("std");
+const path_prefix = @import("../path_prefix.zig");
 
 /// System-critical prefixes (Unix) — always blocked even if they match allowed_paths.
 const SYSTEM_BLOCKED_PREFIXES_UNIX = [_][]const u8{
@@ -42,10 +43,7 @@ else
 
 /// Check whether a directory-style prefix matches (exact or followed by a path separator).
 pub fn pathStartsWith(path: []const u8, prefix: []const u8) bool {
-    if (!std.mem.startsWith(u8, path, prefix)) return false;
-    if (path.len == prefix.len) return true;
-    const c = path[prefix.len];
-    return c == '/' or c == '\\';
+    return path_prefix.pathStartsWith(path, prefix);
 }
 
 /// Check whether a **resolved** absolute path is allowed by the policy:
@@ -65,7 +63,10 @@ pub fn isResolvedPathAllowed(
     // 2. Workspace
     if (pathStartsWith(resolved, ws_resolved)) return true;
     // 3. Allowed paths (resolve each to handle symlinks)
-    for (allowed_paths) |ap| {
+    for (allowed_paths) |raw_allowed_path| {
+        const ap = std.mem.trim(u8, raw_allowed_path, " \t\r\n");
+        if (ap.len == 0) continue;
+        if (std.mem.eql(u8, ap, "*")) return true;
         const ap_resolved = std.fs.cwd().realpathAlloc(allocator, ap) catch continue;
         defer allocator.free(ap_resolved);
         if (pathStartsWith(resolved, ap_resolved)) return true;
@@ -223,12 +224,80 @@ test "isResolvedPathAllowed allows via allowed_paths" {
     ));
 }
 
+test "isResolvedPathAllowed wildcard allows non-system paths" {
+    try std.testing.expect(isResolvedPathAllowed(
+        std.testing.allocator,
+        "/home/user/random/path.txt",
+        "/nonexistent-workspace",
+        &.{"*"},
+    ));
+}
+
+test "isResolvedPathAllowed wildcard with whitespace allows non-system paths" {
+    try std.testing.expect(isResolvedPathAllowed(
+        std.testing.allocator,
+        "/home/user/random/path.txt",
+        "/nonexistent-workspace",
+        &.{"  *  "},
+    ));
+}
+
+test "isResolvedPathAllowed trims allowed path entries before resolving" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    try tmp_dir.dir.writeFile(.{ .sub_path = "test.txt", .data = "" });
+    const file_path = try std.fs.path.join(std.testing.allocator, &.{ tmp_path, "test.txt" });
+    defer std.testing.allocator.free(file_path);
+
+    const spaced_allowed = try std.fmt.allocPrint(std.testing.allocator, "  {s}  ", .{tmp_path});
+    defer std.testing.allocator.free(spaced_allowed);
+
+    try std.testing.expect(isResolvedPathAllowed(
+        std.testing.allocator,
+        file_path,
+        "/nonexistent-workspace",
+        &.{spaced_allowed},
+    ));
+}
+
+test "isResolvedPathAllowed wildcard does not bypass system blocklist" {
+    if (comptime @import("builtin").os.tag == .windows) {
+        try std.testing.expect(!isResolvedPathAllowed(
+            std.testing.allocator,
+            "C:\\Windows\\System32\\cmd.exe",
+            "C:\\Users\\workspace",
+            &.{"*"},
+        ));
+    } else {
+        try std.testing.expect(!isResolvedPathAllowed(
+            std.testing.allocator,
+            "/etc/passwd",
+            "/home/user/workspace",
+            &.{"*"},
+        ));
+    }
+}
+
 test "pathStartsWith exact match" {
     try std.testing.expect(pathStartsWith("/foo/bar", "/foo/bar"));
 }
 
 test "pathStartsWith with trailing component" {
     try std.testing.expect(pathStartsWith("/foo/bar/baz", "/foo/bar"));
+}
+
+test "pathStartsWith windows is case-insensitive" {
+    if (comptime @import("builtin").os.tag != .windows) return;
+    try std.testing.expect(pathStartsWith("c:\\windows\\system32\\cmd.exe", "C:\\Windows"));
+}
+
+test "pathStartsWith windows accepts mixed separators and verbatim prefix" {
+    if (comptime @import("builtin").os.tag != .windows) return;
+    try std.testing.expect(pathStartsWith("C:/Windows/System32/cmd.exe", "C:\\Windows"));
+    try std.testing.expect(pathStartsWith("\\\\?\\C:\\Windows\\System32\\cmd.exe", "C:\\Windows"));
 }
 
 test "pathStartsWith rejects partial" {
