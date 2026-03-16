@@ -13,6 +13,7 @@ zig-cache/
 *.bak
 *.a
 reference/
+nullclaw-config-report.md
 
 result
 .direnv/
