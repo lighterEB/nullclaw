@@ -23,9 +23,9 @@ pub const WebFetchTool = struct {
     allowed_domains: []const []const u8 = &.{}, // empty = allow all
 
     pub const tool_name = "web_fetch";
-    pub const tool_description = "Fetch a web page and extract its text content. Converts HTML to readable text with markdown formatting.";
+    pub const tool_description = "Fetch an HTTPS web page and extract its text content. Converts HTML to readable text with markdown formatting.";
     pub const tool_params =
-        \\{"type":"object","properties":{"url":{"type":"string","description":"URL to fetch (http or https)"},"max_chars":{"type":"integer","default":50000,"description":"Maximum characters to return"}},"required":["url"]}
+        \\{"type":"object","properties":{"url":{"type":"string","description":"HTTPS URL to fetch"},"max_chars":{"type":"integer","default":50000,"description":"Maximum characters to return"}},"required":["url"]}
     ;
 
     const vtable = root.ToolVTable(@This());
@@ -92,6 +92,10 @@ pub const WebFetchTool = struct {
 
         const max_chars = parseMaxCharsWithDefault(args, self.default_max_chars);
 
+        if (builtin.is_test) {
+            return ToolResult.fail("Network disabled in tests");
+        }
+
         // Fetch URL via curl subprocess
         const headers = [_][]const u8{
             "User-Agent: nullclaw/0.1 (web_fetch tool)",
@@ -140,10 +144,10 @@ pub const WebFetchTool = struct {
                 "{s}\n\n[Content truncated at {d} chars, total {d} chars]",
                 .{ extracted[0..max_chars], max_chars, extracted.len },
             );
-            return ToolResult.ok(truncated);
+            return ToolResult{ .success = true, .output = truncated };
         }
 
-        return ToolResult.ok(try allocator.dupe(u8, extracted));
+        return ToolResult{ .success = true, .output = try allocator.dupe(u8, extracted) };
     }
 };
 
@@ -459,8 +463,13 @@ test "WebFetchTool name and description" {
     var wft = WebFetchTool{};
     const t = wft.tool();
     try testing.expectEqualStrings("web_fetch", t.name());
-    try testing.expect(t.description().len > 0);
-    try testing.expect(t.parametersJson()[0] == '{');
+    const description = t.description();
+    const schema = t.parametersJson();
+    try testing.expect(description.len > 0);
+    try testing.expect(std.mem.indexOf(u8, description, "HTTPS") != null);
+    try testing.expect(schema[0] == '{');
+    try testing.expect(std.mem.indexOf(u8, schema, "HTTPS URL to fetch") != null);
+    try testing.expect(std.mem.indexOf(u8, schema, "http or https") == null);
 }
 
 test "WebFetchTool missing url fails" {
@@ -541,11 +550,8 @@ test "WebFetchTool allowlisted local host is allowed (fixes #393)" {
     const parsed = try root.parseTestArgs("{\"url\":\"https://127.0.0.1:8080/\"}");
     defer parsed.deinit();
     const result = try wft.execute(testing.allocator, parsed.value.object);
-    defer if (result.error_msg) |e| testing.allocator.free(e);
-    // Request will fail (no server), but SSRF check should be bypassed
-    if (result.error_msg) |err| {
-        try testing.expect(std.mem.indexOf(u8, err, "Blocked local") == null);
-    }
+    try testing.expect(!result.success);
+    try testing.expectEqualStrings("Network disabled in tests", result.error_msg.?);
 }
 
 test "WebFetchTool non-allowlisted local host still blocked" {
