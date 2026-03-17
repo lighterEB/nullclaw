@@ -4706,7 +4706,7 @@ test "parse irc accounts" {
 test "parse matrix accounts" {
     const allocator = std.testing.allocator;
     const json =
-        \\{"channels": {"matrix": {"accounts": {"main": {"homeserver": "https://matrix.org", "access_token": "syt_abc", "room_id": "!room:matrix.org", "user_id": "@bot:matrix.org", "group_allow_from": ["@alice:matrix.org"], "group_policy": "open"}}}}}
+        \\{"channels": {"matrix": {"accounts": {"main": {"homeserver": "https://matrix.org", "access_token": "syt_abc", "room_id": "!room:matrix.org", "user_id": "@bot:matrix.org", "group_allow_from": ["@alice:matrix.org"], "dm_policy": "open", "group_policy": "open", "require_mention": true}}}}}
     ;
     var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
     try cfg.parseJson(json);
@@ -4717,7 +4717,9 @@ test "parse matrix accounts" {
     try std.testing.expectEqualStrings("syt_abc", mc.access_token);
     try std.testing.expectEqualStrings("!room:matrix.org", mc.room_id);
     try std.testing.expectEqualStrings("@bot:matrix.org", mc.user_id.?);
+    try std.testing.expectEqualStrings("open", mc.dm_policy);
     try std.testing.expectEqualStrings("open", mc.group_policy);
+    try std.testing.expect(mc.require_mention);
     try std.testing.expectEqual(@as(usize, 1), mc.group_allow_from.len);
     try std.testing.expectEqualStrings("@alice:matrix.org", mc.group_allow_from[0]);
     allocator.free(mc.account_id);
@@ -4725,6 +4727,7 @@ test "parse matrix accounts" {
     allocator.free(mc.access_token);
     allocator.free(mc.room_id);
     allocator.free(mc.user_id.?);
+    allocator.free(mc.dm_policy);
     allocator.free(mc.group_policy);
     for (mc.group_allow_from) |entry| allocator.free(entry);
     allocator.free(mc.group_allow_from);

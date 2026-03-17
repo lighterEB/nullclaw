@@ -20,7 +20,9 @@ pub const MatrixChannel = struct {
     user_id: ?[]const u8 = null,
     allow_from: []const []const u8,
     group_allow_from: []const []const u8,
+    dm_policy: []const u8,
     group_policy: []const u8,
+    require_mention: bool = false,
     running: bool = false,
 
     next_batch_buf: [1024]u8 = undefined,
@@ -43,6 +45,7 @@ pub const MatrixChannel = struct {
             .room_id = room_id,
             .allow_from = allow_from,
             .group_allow_from = &.{},
+            .dm_policy = "allowlist",
             .group_policy = "allowlist",
         };
     }
@@ -52,7 +55,9 @@ pub const MatrixChannel = struct {
         ch.account_id = cfg.account_id;
         ch.user_id = cfg.user_id;
         ch.group_allow_from = cfg.group_allow_from;
+        ch.dm_policy = cfg.dm_policy;
         ch.group_policy = cfg.group_policy;
+        ch.require_mention = cfg.require_mention;
         return ch;
     }
 
@@ -115,6 +120,16 @@ pub const MatrixChannel = struct {
         try appendUrlEncoded(w, room_id);
         try w.writeAll("/typing/");
         try appendUrlEncoded(w, user_id);
+        return fbs.getWritten();
+    }
+
+    fn buildJoinUrl(self: *const MatrixChannel, buf: []u8, room_id: []const u8) ![]const u8 {
+        var fbs = std.io.fixedBufferStream(buf);
+        const w = fbs.writer();
+        try w.writeAll(self.homeserver);
+        try w.writeAll("/_matrix/client/v3/rooms/");
+        try appendUrlEncoded(w, room_id);
+        try w.writeAll("/join");
         return fbs.getWritten();
     }
 
@@ -225,13 +240,140 @@ pub const MatrixChannel = struct {
         return std.mem.indexOf(u8, resp, "\"user_id\"") != null;
     }
 
-    fn senderAllowed(self: *const MatrixChannel, sender: []const u8) bool {
+    fn dmSenderAllowed(self: *const MatrixChannel, sender: []const u8) bool {
+        if (std.mem.eql(u8, self.dm_policy, "disabled") or std.mem.eql(u8, self.dm_policy, "deny")) return false;
+        if (std.mem.eql(u8, self.dm_policy, "open") or std.mem.eql(u8, self.dm_policy, "allow")) return true;
+        if (self.allow_from.len == 0) return false;
+        return root.isAllowed(self.allow_from, sender);
+    }
+
+    fn groupSenderAllowed(self: *const MatrixChannel, sender: []const u8, is_mention: bool) bool {
         if (std.mem.eql(u8, self.group_policy, "disabled")) return false;
+        if (std.mem.eql(u8, self.group_policy, "mention_only")) return is_mention;
+        if (self.require_mention and !is_mention) return false;
         if (std.mem.eql(u8, self.group_policy, "open")) return true;
 
         const effective = if (self.group_allow_from.len > 0) self.group_allow_from else self.allow_from;
         if (effective.len == 0) return false;
         return root.isAllowed(effective, sender);
+    }
+
+    fn countUniqueMembers(
+        allocator: std.mem.Allocator,
+        events_val: std.json.Value,
+        members: *std.StringHashMapUnmanaged(void),
+    ) !void {
+        if (events_val != .array) return;
+
+        for (events_val.array.items) |event| {
+            if (event != .object) continue;
+
+            const type_val = event.object.get("type") orelse continue;
+            if (type_val != .string or !std.mem.eql(u8, type_val.string, "m.room.member")) continue;
+
+            const state_key_val = event.object.get("state_key") orelse continue;
+            if (state_key_val != .string or state_key_val.string.len == 0) continue;
+
+            const content_val = event.object.get("content") orelse continue;
+            if (content_val != .object) continue;
+
+            const membership_val = content_val.object.get("membership") orelse continue;
+            if (membership_val != .string) continue;
+
+            const membership = membership_val.string;
+            if (!std.mem.eql(u8, membership, "join") and !std.mem.eql(u8, membership, "invite")) continue;
+
+            try members.put(allocator, state_key_val.string, {});
+        }
+    }
+
+    fn extractInviteRoomIds(allocator: std.mem.Allocator, payload: []const u8) ![]const []const u8 {
+        var rooms: std.ArrayListUnmanaged([]const u8) = .empty;
+        errdefer {
+            for (rooms.items) |room_id| allocator.free(room_id);
+            rooms.deinit(allocator);
+        }
+
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, payload, .{}) catch return &.{};
+        defer parsed.deinit();
+
+        if (parsed.value != .object) return &.{};
+        const rooms_val = parsed.value.object.get("rooms") orelse return &.{};
+        if (rooms_val != .object) return &.{};
+
+        const invite_val = rooms_val.object.get("invite") orelse return &.{};
+        if (invite_val != .object) return &.{};
+
+        var it = invite_val.object.iterator();
+        while (it.next()) |entry| {
+            if (entry.key_ptr.*.len == 0) continue;
+            try rooms.append(allocator, try allocator.dupe(u8, entry.key_ptr.*));
+        }
+
+        return if (rooms.items.len == 0) &.{} else try rooms.toOwnedSlice(allocator);
+    }
+
+    fn acceptInvite(self: *MatrixChannel, room_id: []const u8) !void {
+        if (builtin.is_test) return;
+
+        var url_buf: [2048]u8 = undefined;
+        const url = try self.buildJoinUrl(&url_buf, room_id);
+
+        const auth_header = try self.authHeader(self.allocator);
+        defer self.allocator.free(auth_header);
+
+        const headers = [_][]const u8{auth_header};
+        const resp = try root.http_util.curlPost(self.allocator, url, "{}", &headers);
+        defer self.allocator.free(resp);
+    }
+
+    fn acceptInvitesFromSync(self: *MatrixChannel, allocator: std.mem.Allocator, payload: []const u8) !void {
+        const invite_room_ids = try extractInviteRoomIds(allocator, payload);
+        defer {
+            for (invite_room_ids) |room_id| allocator.free(room_id);
+            if (invite_room_ids.len > 0) allocator.free(invite_room_ids);
+        }
+
+        for (invite_room_ids) |room_id| {
+            self.acceptInvite(room_id) catch |err| {
+                log.warn("Matrix invite auto-join failed for {s}: {}", .{ room_id, err });
+            };
+        }
+    }
+
+    fn eventMentionsUser(self: *const MatrixChannel, content_obj: std.json.ObjectMap, body: []const u8) bool {
+        const user_id = self.user_id orelse return false;
+        if (user_id.len == 0) return false;
+
+        if (content_obj.get("m.mentions")) |mentions_val| {
+            if (mentions_val == .object) {
+                if (mentions_val.object.get("user_ids")) |user_ids_val| {
+                    if (user_ids_val == .array) {
+                        for (user_ids_val.array.items) |item| {
+                            if (item == .string and std.mem.eql(u8, item.string, user_id)) return true;
+                        }
+                    }
+                }
+            }
+        }
+
+        if (content_obj.get("formatted_body")) |formatted_val| {
+            if (formatted_val == .string and std.mem.indexOf(u8, formatted_val.string, user_id) != null) return true;
+        }
+
+        if (std.mem.indexOf(u8, body, user_id) != null) return true;
+
+        if (std.mem.startsWith(u8, user_id, "@")) {
+            const colon_idx = std.mem.indexOfScalar(u8, user_id, ':') orelse user_id.len;
+            if (colon_idx > 1) {
+                const local = user_id[1..colon_idx];
+                var mention_buf: [256]u8 = undefined;
+                const handle = std.fmt.bufPrint(&mention_buf, "@{s}", .{local}) catch return false;
+                if (std.ascii.indexOfIgnoreCase(body, handle) != null) return true;
+            }
+        }
+
+        return false;
     }
 
     fn collectDirectRooms(
@@ -325,6 +467,10 @@ pub const MatrixChannel = struct {
             if (state_val == .object) {
                 if (state_val.object.get("events")) |state_events| {
                     if (eventArrayHasDirectMemberFlag(state_events)) return true;
+                    var members: std.StringHashMapUnmanaged(void) = .empty;
+                    defer members.deinit(std.heap.page_allocator);
+                    countUniqueMembers(std.heap.page_allocator, state_events, &members) catch {};
+                    if (members.count() > 0 and members.count() <= 2) return true;
                 }
             }
         }
@@ -333,6 +479,10 @@ pub const MatrixChannel = struct {
             if (timeline_val == .object) {
                 if (timeline_val.object.get("events")) |timeline_events| {
                     if (eventArrayHasDirectMemberFlag(timeline_events)) return true;
+                    var members: std.StringHashMapUnmanaged(void) = .empty;
+                    defer members.deinit(std.heap.page_allocator);
+                    countUniqueMembers(std.heap.page_allocator, timeline_events, &members) catch {};
+                    if (members.count() > 0 and members.count() <= 2) return true;
                 }
             }
         }
@@ -378,6 +528,9 @@ pub const MatrixChannel = struct {
 
             const timeline_val = room.object.get("timeline") orelse continue;
             if (timeline_val != .object) continue;
+            if (timeline_val.object.get("limited")) |limited_val| {
+                if (limited_val == .bool and limited_val.bool) continue;
+            }
 
             const events_val = timeline_val.object.get("events") orelse continue;
             if (events_val != .array) continue;
@@ -397,8 +550,6 @@ pub const MatrixChannel = struct {
                     if (std.mem.eql(u8, uid, sender)) continue;
                 }
 
-                if (!self.senderAllowed(sender)) continue;
-
                 const content_val = event.object.get("content") orelse continue;
                 if (content_val != .object) continue;
 
@@ -406,6 +557,13 @@ pub const MatrixChannel = struct {
                 if (body_val != .string) continue;
                 const body = std.mem.trim(u8, body_val.string, " \t\r\n");
                 if (body.len == 0) continue;
+
+                const is_mention = self.eventMentionsUser(content_val.object, body);
+                if (room_is_direct) {
+                    if (!self.dmSenderAllowed(sender)) continue;
+                } else {
+                    if (!self.groupSenderAllowed(sender, is_mention)) continue;
+                }
 
                 const event_id: []const u8 = blk: {
                     if (event.object.get("event_id")) |eid| {
@@ -440,6 +598,7 @@ pub const MatrixChannel = struct {
 
     pub fn pollMessages(self: *MatrixChannel, allocator: std.mem.Allocator) ![]root.ChannelMessage {
         if (builtin.is_test) return &.{};
+        const is_initial_sync = self.next_batch_len == 0;
 
         var url_buf: [4096]u8 = undefined;
         const url = try self.buildSyncUrl(&url_buf);
@@ -455,7 +614,14 @@ pub const MatrixChannel = struct {
         defer allocator.free(resp);
 
         if (resp.len == 0) return &.{};
-        return self.parseSyncResponse(allocator, resp);
+        try self.acceptInvitesFromSync(allocator, resp);
+
+        const messages = try self.parseSyncResponse(allocator, resp);
+        if (!is_initial_sync) return messages;
+
+        for (messages) |*msg| msg.deinit(allocator);
+        if (messages.len > 0) allocator.free(messages);
+        return &.{};
     }
 
     fn vtableStart(ptr: *anyopaque) anyerror!void {
@@ -545,14 +711,18 @@ test "MatrixChannel initFromConfig maps account and policy fields" {
         .user_id = "@bot:example",
         .allow_from = &.{"@alice:example"},
         .group_allow_from = &.{"@bob:example"},
+        .dm_policy = "open",
         .group_policy = "open",
+        .require_mention = true,
     };
 
     const ch = MatrixChannel.initFromConfig(std.testing.allocator, cfg);
     try std.testing.expectEqualStrings("work", ch.account_id);
     try std.testing.expectEqualStrings("https://matrix.example", ch.homeserver);
     try std.testing.expectEqualStrings("@bot:example", ch.user_id.?);
+    try std.testing.expectEqualStrings("open", ch.dm_policy);
     try std.testing.expectEqualStrings("open", ch.group_policy);
+    try std.testing.expect(ch.require_mention);
     try std.testing.expectEqual(@as(usize, 1), ch.allow_from.len);
     try std.testing.expectEqual(@as(usize, 1), ch.group_allow_from.len);
 }
@@ -767,6 +937,76 @@ test "MatrixChannel parseSyncResponse allowlist and policy semantics" {
     try std.testing.expectEqual(@as(usize, 1), open_msgs.len);
 }
 
+test "MatrixChannel parseSyncResponse mention_only requires mention in group rooms" {
+    const allocator = std.testing.allocator;
+
+    var ch = MatrixChannel.init(
+        allocator,
+        "https://matrix.example",
+        "tok",
+        "!room:example",
+        &.{"*"},
+    );
+    ch.user_id = "@bot:example";
+    ch.group_policy = "mention_only";
+
+    const payload =
+        \\{
+        \\  "rooms": { "join": { "!room:example": { "timeline": { "events": [
+        \\    {"type":"m.room.message","sender":"@alice:example","event_id":"$evt-a","content":{"msgtype":"m.text","body":"hello"}},
+        \\    {"type":"m.room.message","sender":"@bob:example","event_id":"$evt-b","content":{"msgtype":"m.text","body":"ping","m.mentions":{"user_ids":["@bot:example"]}}}
+        \\  ]}}}}
+        \\}
+    ;
+
+    const msgs = try ch.parseSyncResponse(allocator, payload);
+    defer {
+        for (msgs) |*m| m.deinit(allocator);
+        if (msgs.len > 0) allocator.free(msgs);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), msgs.len);
+    try std.testing.expectEqualStrings("@bob:example", msgs[0].sender);
+}
+
+test "MatrixChannel parseSyncResponse dm_policy disabled blocks direct messages" {
+    const allocator = std.testing.allocator;
+
+    var ch = MatrixChannel.init(
+        allocator,
+        "https://matrix.example",
+        "tok",
+        "!dm:example",
+        &.{"@alice:example"},
+    );
+    ch.dm_policy = "disabled";
+
+    const payload =
+        \\{
+        \\  "account_data": {
+        \\    "events": [
+        \\      {
+        \\        "type": "m.direct",
+        \\        "content": {
+        \\          "@alice:example": ["!dm:example"]
+        \\        }
+        \\      }
+        \\    ]
+        \\  },
+        \\  "rooms": { "join": { "!dm:example": { "timeline": { "events": [
+        \\    {"type":"m.room.message","sender":"@alice:example","content":{"msgtype":"m.text","body":"hello"}}
+        \\  ]}}}}
+        \\}
+    ;
+
+    const msgs = try ch.parseSyncResponse(allocator, payload);
+    defer {
+        for (msgs) |*m| m.deinit(allocator);
+        if (msgs.len > 0) allocator.free(msgs);
+    }
+    try std.testing.expectEqual(@as(usize, 0), msgs.len);
+}
+
 test "MatrixChannel parseSyncResponse drops all when group_policy is disabled" {
     const allocator = std.testing.allocator;
 
@@ -838,6 +1078,61 @@ test "MatrixChannel parseSyncResponse skips self and malformed payload safely" {
         if (malformed.len > 0) allocator.free(malformed);
     }
     try std.testing.expectEqual(@as(usize, 0), malformed.len);
+}
+
+test "MatrixChannel parseSyncResponse drops limited timelines as backlog" {
+    const allocator = std.testing.allocator;
+
+    var ch = MatrixChannel.init(
+        allocator,
+        "https://matrix.example",
+        "tok",
+        "!room:example",
+        &.{"*"},
+    );
+    ch.group_policy = "open";
+
+    const payload =
+        \\{
+        \\  "rooms": { "join": { "!room:example": { "timeline": {
+        \\    "limited": true,
+        \\    "events": [
+        \\      {"type":"m.room.message","sender":"@alice:example","content":{"msgtype":"m.text","body":"old backlog"}}
+        \\    ]
+        \\  }}}}
+        \\}
+    ;
+
+    const msgs = try ch.parseSyncResponse(allocator, payload);
+    defer {
+        for (msgs) |*m| m.deinit(allocator);
+        if (msgs.len > 0) allocator.free(msgs);
+    }
+    try std.testing.expectEqual(@as(usize, 0), msgs.len);
+}
+
+test "MatrixChannel extractInviteRoomIds returns invited rooms" {
+    const allocator = std.testing.allocator;
+    const payload =
+        \\{
+        \\  "rooms": {
+        \\    "invite": {
+        \\      "!a:example": {},
+        \\      "!b:example": {}
+        \\    }
+        \\  }
+        \\}
+    ;
+
+    const invite_room_ids = try MatrixChannel.extractInviteRoomIds(allocator, payload);
+    defer {
+        for (invite_room_ids) |room_id| allocator.free(room_id);
+        if (invite_room_ids.len > 0) allocator.free(invite_room_ids);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), invite_room_ids.len);
+    try std.testing.expectEqualStrings("!a:example", invite_room_ids[0]);
+    try std.testing.expectEqualStrings("!b:example", invite_room_ids[1]);
 }
 
 test "MatrixChannel parseSyncResponse group_allow_from overrides fallback allow_from" {

@@ -406,7 +406,9 @@ pub const MatrixConfig = struct {
     user_id: ?[]const u8 = null,
     allow_from: []const []const u8 = &.{},
     group_allow_from: []const []const u8 = &.{},
+    dm_policy: []const u8 = "allowlist",
     group_policy: []const u8 = "allowlist",
+    require_mention: bool = false,
 };
 
 pub const MattermostConfig = struct {
