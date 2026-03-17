@@ -62,6 +62,11 @@ const ClaimToken = struct {
     signature_hex: []const u8,
 };
 
+const ClaimStateSnapshot = struct {
+    generation: u64,
+    content: []u8,
+};
+
 fn messageLogPreview(text: []const u8) struct { slice: []const u8, truncated: bool } {
     if (text.len <= MESSAGE_LOG_MAX_BYTES) {
         return .{ .slice = text, .truncated = false };
@@ -214,6 +219,7 @@ pub const SessionManager = struct {
 
     mutex: std.Thread.Mutex,
     usage_log_mutex: std.Thread.Mutex,
+    claim_state_io_mutex: std.Thread.Mutex,
     usage_ledger_state_initialized: bool,
     usage_ledger_window_started_at: i64,
     usage_ledger_line_count: u64,
@@ -221,6 +227,8 @@ pub const SessionManager = struct {
     agent_runtimes: std.StringHashMapUnmanaged(*AgentRuntime),
     claim_state_path: ?[]u8 = null,
     claim_state_loaded: bool = false,
+    claim_state_generation: u64 = 0,
+    claim_state_persisted_generation: u64 = 0,
     verified_bindings: std.StringHashMapUnmanaged(VerifiedBinding),
     used_claim_nonces: std.StringHashMapUnmanaged(i64),
     claim_attempts: std.StringHashMapUnmanaged(ClaimAttempt),
@@ -256,6 +264,7 @@ pub const SessionManager = struct {
             .subagent_manager = detectSubagentManager(tools),
             .mutex = .{},
             .usage_log_mutex = .{},
+            .claim_state_io_mutex = .{},
             .usage_ledger_state_initialized = false,
             .usage_ledger_window_started_at = 0,
             .usage_ledger_line_count = 0,
@@ -263,6 +272,8 @@ pub const SessionManager = struct {
             .agent_runtimes = .{},
             .claim_state_path = claim_state_path,
             .claim_state_loaded = false,
+            .claim_state_generation = 0,
+            .claim_state_persisted_generation = 0,
             .verified_bindings = .{},
             .used_claim_nonces = .{},
             .claim_attempts = .{},
@@ -528,17 +539,19 @@ pub const SessionManager = struct {
         }
     }
 
-    fn evictClaimAttemptLocked(self: *SessionManager, binding_key: []const u8) void {
+    fn evictClaimAttemptLocked(self: *SessionManager, binding_key: []const u8) bool {
         if (self.claim_attempts.fetchRemove(binding_key)) |entry| {
             self.allocator.free(entry.key);
+            return true;
         }
+        return false;
     }
 
     fn claimAttemptStatusLocked(self: *SessionManager, binding_key: []const u8, now_ts: i64) ?ClaimAttempt {
         const attempt = self.claim_attempts.getPtr(binding_key) orelse return null;
         if (attempt.locked_until > now_ts) return attempt.*;
         if (attempt.failures == 0) {
-            self.evictClaimAttemptLocked(binding_key);
+            _ = self.evictClaimAttemptLocked(binding_key);
             return null;
         }
         return attempt.*;
@@ -723,10 +736,99 @@ pub const SessionManager = struct {
         }
     }
 
-    fn saveClaimStateLocked(self: *SessionManager) void {
-        const path = self.claim_state_path orelse return;
+    fn markClaimStateDirtyLocked(self: *SessionManager) void {
+        self.claim_state_generation += 1;
+    }
+
+    fn captureClaimStateSnapshotLocked(self: *SessionManager) ?ClaimStateSnapshot {
+        if (self.claim_state_path == null) return null;
+        if (self.claim_state_generation <= self.claim_state_persisted_generation) return null;
+
         const now_ts = std.time.timestamp();
         self.clearExpiredClaimNoncesLocked(now_ts);
+
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer buf.deinit(self.allocator);
+        const w = buf.writer(self.allocator);
+
+        w.print("{{\"version\":{d},\"bindings\":[", .{CLAIM_STATE_VERSION}) catch return null;
+
+        var wrote_binding = false;
+        var binding_it = self.verified_bindings.iterator();
+        while (binding_it.next()) |entry| {
+            const split = splitClaimBindingKey(entry.key_ptr.*) orelse continue;
+            if (wrote_binding) w.writeAll(",") catch return null;
+            w.print(
+                "{{\"channel\":{f},\"account_id\":{f},\"peer_id\":{f},\"canonical_user_id\":{f},\"verified_at\":{d}}}",
+                .{
+                    std.json.fmt(split.channel, .{}),
+                    std.json.fmt(split.account_id, .{}),
+                    std.json.fmt(split.peer_id, .{}),
+                    std.json.fmt(entry.value_ptr.canonical_user_id, .{}),
+                    entry.value_ptr.verified_at,
+                },
+            ) catch return null;
+            wrote_binding = true;
+        }
+
+        w.writeAll("],\"used_nonces\":[") catch return null;
+        var wrote_nonce = false;
+        var nonce_it = self.used_claim_nonces.iterator();
+        while (nonce_it.next()) |entry| {
+            if (entry.value_ptr.* <= now_ts) continue;
+            if (wrote_nonce) w.writeAll(",") catch return null;
+            w.print(
+                "{{\"nonce\":{f},\"expires_at\":{d}}}",
+                .{
+                    std.json.fmt(entry.key_ptr.*, .{}),
+                    entry.value_ptr.*,
+                },
+            ) catch return null;
+            wrote_nonce = true;
+        }
+
+        w.writeAll("],\"attempts\":[") catch return null;
+        var wrote_attempt = false;
+        var attempt_it = self.claim_attempts.iterator();
+        while (attempt_it.next()) |entry| {
+            const attempt = entry.value_ptr.*;
+            if (attempt.failures == 0 and attempt.locked_until <= now_ts) continue;
+            const split = splitClaimBindingKey(entry.key_ptr.*) orelse continue;
+            if (wrote_attempt) w.writeAll(",") catch return null;
+            w.print(
+                "{{\"channel\":{f},\"account_id\":{f},\"peer_id\":{f},\"failures\":{d},\"locked_until\":{d}}}",
+                .{
+                    std.json.fmt(split.channel, .{}),
+                    std.json.fmt(split.account_id, .{}),
+                    std.json.fmt(split.peer_id, .{}),
+                    attempt.failures,
+                    attempt.locked_until,
+                },
+            ) catch return null;
+            wrote_attempt = true;
+        }
+
+        w.writeAll("]}") catch return null;
+        const content = buf.toOwnedSlice(self.allocator) catch return null;
+        return .{
+            .generation = self.claim_state_generation,
+            .content = content,
+        };
+    }
+
+    fn persistClaimStateSnapshot(self: *SessionManager, snapshot: ?ClaimStateSnapshot) void {
+        const claim_snapshot = snapshot orelse return;
+        defer self.allocator.free(claim_snapshot.content);
+
+        const path = self.claim_state_path orelse return;
+
+        self.claim_state_io_mutex.lock();
+        defer self.claim_state_io_mutex.unlock();
+
+        self.mutex.lock();
+        const is_stale = claim_snapshot.generation <= self.claim_state_persisted_generation;
+        self.mutex.unlock();
+        if (is_stale) return;
 
         if (std.fs.path.dirname(path)) |parent| {
             std.fs.makeDirAbsolute(parent) catch |err| switch (err) {
@@ -737,72 +839,29 @@ pub const SessionManager = struct {
             };
         }
 
-        const file = std.fs.createFileAbsolute(path, .{ .truncate = true }) catch return;
-        defer file.close();
+        const tmp_path = std.fmt.allocPrint(self.allocator, "{s}.tmp", .{path}) catch return;
+        defer self.allocator.free(tmp_path);
 
-        var buf: [4096]u8 = undefined;
-        var bw = file.writer(&buf);
-        const w = &bw.interface;
+        var tmp_file = std.fs.createFileAbsolute(tmp_path, .{}) catch return;
+        tmp_file.writeAll(claim_snapshot.content) catch {
+            tmp_file.close();
+            std.fs.deleteFileAbsolute(tmp_path) catch {};
+            return;
+        };
+        tmp_file.close();
 
-        w.print("{{\"version\":{d},\"bindings\":[", .{CLAIM_STATE_VERSION}) catch return;
+        std.fs.renameAbsolute(tmp_path, path) catch {
+            std.fs.deleteFileAbsolute(tmp_path) catch {};
+            const file = std.fs.createFileAbsolute(path, .{ .truncate = true }) catch return;
+            defer file.close();
+            file.writeAll(claim_snapshot.content) catch return;
+        };
 
-        var wrote_binding = false;
-        var binding_it = self.verified_bindings.iterator();
-        while (binding_it.next()) |entry| {
-            const split = splitClaimBindingKey(entry.key_ptr.*) orelse continue;
-            if (wrote_binding) w.writeAll(",") catch return;
-            w.print(
-                "{{\"channel\":{f},\"account_id\":{f},\"peer_id\":{f},\"canonical_user_id\":{f},\"verified_at\":{d}}}",
-                .{
-                    std.json.fmt(split.channel, .{}),
-                    std.json.fmt(split.account_id, .{}),
-                    std.json.fmt(split.peer_id, .{}),
-                    std.json.fmt(entry.value_ptr.canonical_user_id, .{}),
-                    entry.value_ptr.verified_at,
-                },
-            ) catch return;
-            wrote_binding = true;
+        self.mutex.lock();
+        if (claim_snapshot.generation > self.claim_state_persisted_generation) {
+            self.claim_state_persisted_generation = claim_snapshot.generation;
         }
-
-        w.writeAll("],\"used_nonces\":[") catch return;
-        var wrote_nonce = false;
-        var nonce_it = self.used_claim_nonces.iterator();
-        while (nonce_it.next()) |entry| {
-            if (entry.value_ptr.* <= now_ts) continue;
-            if (wrote_nonce) w.writeAll(",") catch return;
-            w.print(
-                "{{\"nonce\":{f},\"expires_at\":{d}}}",
-                .{
-                    std.json.fmt(entry.key_ptr.*, .{}),
-                    entry.value_ptr.*,
-                },
-            ) catch return;
-            wrote_nonce = true;
-        }
-
-        w.writeAll("],\"attempts\":[") catch return;
-        var wrote_attempt = false;
-        var attempt_it = self.claim_attempts.iterator();
-        while (attempt_it.next()) |entry| {
-            const attempt = entry.value_ptr.*;
-            if (attempt.failures == 0 and attempt.locked_until <= now_ts) continue;
-            const split = splitClaimBindingKey(entry.key_ptr.*) orelse continue;
-            if (wrote_attempt) w.writeAll(",") catch return;
-            w.print(
-                "{{\"channel\":{f},\"account_id\":{f},\"peer_id\":{f},\"failures\":{d},\"locked_until\":{d}}}",
-                .{
-                    std.json.fmt(split.channel, .{}),
-                    std.json.fmt(split.account_id, .{}),
-                    std.json.fmt(split.peer_id, .{}),
-                    attempt.failures,
-                    attempt.locked_until,
-                },
-            ) catch return;
-            wrote_attempt = true;
-        }
-
-        w.writeAll("]}") catch return;
-        w.flush() catch return;
+        self.mutex.unlock();
     }
 
     fn claimTokenArg(message: []const u8) ?[]const u8 {
@@ -848,16 +907,22 @@ pub const SessionManager = struct {
                 return self.allocator.dupe(u8, "Invalid revoke secret.") catch null;
             }
 
+            var removed = false;
+            var snapshot: ?ClaimStateSnapshot = null;
             self.mutex.lock();
-            defer self.mutex.unlock();
-
-            const removed = self.removeVerifiedBindingLocked(direct_ctx.channel, direct_ctx.account_id, direct_ctx.peer_id);
+            removed = self.removeVerifiedBindingLocked(direct_ctx.channel, direct_ctx.account_id, direct_ctx.peer_id);
             const attempt_key = self.claimBindingKeyOwned(direct_ctx.channel, direct_ctx.account_id, direct_ctx.peer_id) catch null;
+            var cleared_attempts = false;
             if (attempt_key) |k| {
-                self.evictClaimAttemptLocked(k);
+                cleared_attempts = self.evictClaimAttemptLocked(k);
                 self.allocator.free(k);
             }
-            self.saveClaimStateLocked();
+            if (removed or cleared_attempts) {
+                self.markClaimStateDirtyLocked();
+                snapshot = self.captureClaimStateSnapshotLocked();
+            }
+            self.mutex.unlock();
+            self.persistClaimStateSnapshot(snapshot);
 
             if (removed) {
                 return self.allocator.dupe(u8, "Identity link revoked. This peer is back in gatekeeper mode.") catch null;
@@ -866,13 +931,12 @@ pub const SessionManager = struct {
         }
 
         const claim_token = claimTokenArg(content);
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
         const binding_key = self.claimBindingKeyOwned(direct_ctx.channel, direct_ctx.account_id, direct_ctx.peer_id) catch return null;
         defer self.allocator.free(binding_key);
 
+        self.mutex.lock();
         if (self.verified_bindings.get(binding_key)) |_| {
+            self.mutex.unlock();
             if (claim_token != null) {
                 return self.allocator.dupe(u8, "This peer is already verified.") catch null;
             }
@@ -881,6 +945,7 @@ pub const SessionManager = struct {
 
         if (self.claimAttemptStatusLocked(binding_key, now_ts)) |attempt| {
             if (attempt.locked_until > now_ts) {
+                self.mutex.unlock();
                 const remaining = @as(u64, @intCast(attempt.locked_until - now_ts));
                 return std.fmt.allocPrint(
                     self.allocator,
@@ -901,8 +966,11 @@ pub const SessionManager = struct {
                     now_ts,
                 );
                 self.putClaimNonceLocked(token.nonce, token.expires_at);
-                self.evictClaimAttemptLocked(binding_key);
-                self.saveClaimStateLocked();
+                _ = self.evictClaimAttemptLocked(binding_key);
+                self.markClaimStateDirtyLocked();
+                const snapshot = self.captureClaimStateSnapshotLocked();
+                self.mutex.unlock();
+                self.persistClaimStateSnapshot(snapshot);
                 return std.fmt.allocPrint(
                     self.allocator,
                     "Identity verified as '{s}'. Dedicated agent runtime unlocked.",
@@ -911,13 +979,17 @@ pub const SessionManager = struct {
             }
 
             self.registerClaimFailureLocked(binding_key, now_ts);
-            self.saveClaimStateLocked();
+            self.markClaimStateDirtyLocked();
+            const snapshot = self.captureClaimStateSnapshotLocked();
+            self.mutex.unlock();
+            self.persistClaimStateSnapshot(snapshot);
             return self.allocator.dupe(
                 u8,
                 "Invalid or expired claim token. Use `/claim v1:<exp>:<canonical>:<nonce>:<hmac_sha256_hex>`.",
             ) catch null;
         }
 
+        self.mutex.unlock();
         return self.allocator.dupe(
             u8,
             "Identity verification required before agent provisioning. Send `/claim <token>` to continue.",

@@ -10,6 +10,7 @@ const config_types = @import("config_types.zig");
 const telegram = @import("channels/telegram.zig");
 const session_mod = @import("session.zig");
 const ConversationContext = @import("agent/prompt.zig").ConversationContext;
+const buildConversationContext = @import("agent/prompt.zig").buildConversationContext;
 const providers = @import("providers/root.zig");
 const memory_mod = @import("memory/root.zig");
 const bootstrap_mod = @import("bootstrap/root.zig");
@@ -749,13 +750,13 @@ fn processTelegramMessage(
     defer setScheduleToolContext(runtime.tools, null, null, null);
 
     // Build conversation context for Telegram
-    const conversation_context: ?ConversationContext = .{
+    const conversation_context = buildConversationContext(.{
         .channel = "telegram",
         .account_id = tg_ptr.account_id,
         .peer_id = sender,
         .is_group = is_group,
         .group_id = if (is_group) sender else null,
-    };
+    });
 
     var stream_ctx = telegram.TelegramChannel.StreamCtx{
         .tg_ptr = tg_ptr,
@@ -1580,7 +1581,7 @@ pub fn runSignalLoop(
             defer if (typing_target) |target| sg_ptr.stopTyping(target) catch {};
 
             // Build conversation context for Signal
-            const conversation_context: ?ConversationContext = .{
+            const conversation_context = buildConversationContext(.{
                 .channel = "signal",
                 .account_id = sg_ptr.account_id,
                 .sender_number = if (msg.sender.len > 0 and msg.sender[0] == '+') msg.sender else null,
@@ -1588,7 +1589,7 @@ pub fn runSignalLoop(
                 .peer_id = if (msg.is_group) msg.group_id else msg.sender,
                 .group_id = msg.group_id,
                 .is_group = msg.is_group,
-            };
+            });
 
             const reply = runtime.session_mgr.processMessage(session_key, msg.content, conversation_context) catch |err| {
                 log.err("Signal agent error: {}", .{err});
@@ -1816,13 +1817,13 @@ pub fn runMatrixLoop(
             mx_ptr.startTyping(typing_target) catch {};
             defer mx_ptr.stopTyping(typing_target) catch {};
 
-            const conversation_context: ?ConversationContext = .{
+            const conversation_context = buildConversationContext(.{
                 .channel = "matrix",
                 .account_id = mx_ptr.account_id,
                 .peer_id = if (msg.is_group) room_peer_id else msg.sender,
                 .is_group = msg.is_group,
                 .group_id = if (msg.is_group) room_peer_id else null,
-            };
+            });
 
             const reply = runtime.session_mgr.processMessage(session_key, msg.content, conversation_context) catch |err| {
                 log.err("Matrix agent error: {}", .{err});
@@ -1957,13 +1958,13 @@ pub fn runMaxLoop(
             mx_ptr.startTyping(reply_target) catch {};
             defer mx_ptr.stopTyping(reply_target) catch {};
 
-            const conversation_context: ?ConversationContext = .{
+            const conversation_context = buildConversationContext(.{
                 .channel = "max",
                 .account_id = mx_ptr.account_id,
                 .peer_id = if (msg.is_group) reply_target else msg.sender,
                 .is_group = msg.is_group,
                 .group_id = if (msg.is_group) reply_target else null,
-            };
+            });
 
             var stream_ctx = max_mod.MaxChannel.StreamCtx{
                 .max_ptr = mx_ptr,

@@ -34,6 +34,7 @@ const bus_mod = @import("bus.zig");
 const a2a = @import("a2a.zig");
 const thread_stacks = @import("thread_stacks.zig");
 const ConversationContext = @import("agent/prompt.zig").ConversationContext;
+const buildConversationContext = @import("agent/prompt.zig").buildConversationContext;
 
 /// Maximum request body size (64KB) — prevents memory exhaustion.
 pub const MAX_BODY_SIZE: usize = 65_536;
@@ -66,14 +67,14 @@ fn simpleConversationContext(
     peer_id: []const u8,
     is_group: bool,
     group_id: ?[]const u8,
-) ConversationContext {
-    return .{
+) ?ConversationContext {
+    return buildConversationContext(.{
         .channel = channel,
         .account_id = account_id,
         .peer_id = peer_id,
         .is_group = is_group,
         .group_id = if (is_group) (group_id orelse peer_id) else null,
-    };
+    });
 }
 
 const GatewayTurnToolEvent = struct {
@@ -3290,12 +3291,12 @@ fn handleTeamsWebhookRoute(ctx: *WebhookHandlerContext) void {
         }
     }
 
-    const conversation_context: ?@import("agent/prompt.zig").ConversationContext = .{
+    const conversation_context = buildConversationContext(.{
         .channel = "teams",
         .sender_uuid = from_id,
         .sender_name = from_name,
         .is_group = false,
-    };
+    });
 
     if (ctx.state.event_bus) |eb| {
         _ = publishToBus(eb, ctx.state.allocator, "teams", from_id, chat_id, text, sk, metadata);

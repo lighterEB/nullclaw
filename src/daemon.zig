@@ -26,6 +26,7 @@ const bootstrap_mod = @import("bootstrap/root.zig");
 const onboard = @import("onboard.zig");
 const streaming = @import("streaming.zig");
 const ConversationContext = @import("agent/prompt.zig").ConversationContext;
+const buildConversationContext = @import("agent/prompt.zig").buildConversationContext;
 const thread_stacks = @import("thread_stacks.zig");
 const tunnel_mod = @import("tunnel.zig");
 
@@ -588,11 +589,9 @@ fn buildInboundConversationContext(
 
     const has_sender_identity = meta.sender_username != null or meta.sender_display_name != null;
     const has_scope = inferred_is_group != null or group_id != null or meta.peer_id != null or meta.guild_id != null or meta.channel_id != null;
-    const has_channel = msg.channel.len > 0;
-    if (!has_channel and !has_sender_identity and !has_scope) return null;
 
-    return .{
-        .channel = if (has_channel) msg.channel else null,
+    return buildConversationContext(.{
+        .channel = if (msg.channel.len > 0) msg.channel else null,
         .account_id = meta.account_id,
         .sender_id = if (has_sender_identity or has_scope) msg.sender_id else null,
         .sender_username = meta.sender_username,
@@ -600,7 +599,7 @@ fn buildInboundConversationContext(
         .peer_id = meta.peer_id orelse if (has_scope) msg.chat_id else null,
         .group_id = group_id,
         .is_group = inferred_is_group,
-    };
+    });
 }
 
 fn resolveInboundRouteSessionKeyWithMetadata(

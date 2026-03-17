@@ -454,6 +454,9 @@ pub fn resolveRouteWithSession(
         input.account_id,
         session.identity_links,
     );
+    if (auto_provision_candidate != null) {
+        route.agent_id = route.main_session_key["agent:".len .. route.main_session_key.len - ":main".len];
+    }
     return route;
 }
 
@@ -1556,7 +1559,7 @@ test "resolveRouteWithSession auto-provisions direct peer into synthetic agent s
     defer allocator.free(route.session_key);
     defer allocator.free(route.main_session_key);
 
-    try std.testing.expectEqualStrings("main", route.agent_id);
+    try std.testing.expect(std.mem.startsWith(u8, route.agent_id, "peer-"));
     try std.testing.expect(std.mem.startsWith(u8, route.main_session_key, "agent:peer-"));
     try std.testing.expect(std.mem.endsWith(u8, route.main_session_key, ":main"));
     try std.testing.expect(std.mem.startsWith(u8, route.session_key, "agent:peer-"));

@@ -143,6 +143,56 @@ pub const ConversationContext = struct {
     }
 };
 
+/// Normalize partially-filled inbound metadata into a stable conversation context.
+pub fn buildConversationContext(args: ConversationContext) ?ConversationContext {
+    const channel = normalizeOptionalString(args.channel);
+    const account_id = normalizeOptionalString(args.account_id);
+    const sender_number = normalizeOptionalString(args.sender_number);
+    const sender_uuid = normalizeOptionalString(args.sender_uuid);
+    const sender_name = normalizeOptionalString(args.sender_name);
+    const sender_id = normalizeOptionalString(args.sender_id);
+    const sender_username = normalizeOptionalString(args.sender_username);
+    const sender_display_name = normalizeOptionalString(args.sender_display_name);
+    const peer_id = normalizeOptionalString(args.peer_id);
+    const is_group = args.is_group;
+    const group_id = if (normalizeOptionalString(args.group_id)) |value|
+        value
+    else if (is_group != null and is_group.? and peer_id != null)
+        peer_id
+    else
+        null;
+
+    const has_sender_identity = sender_id != null or
+        sender_uuid != null or
+        sender_number != null or
+        sender_name != null or
+        sender_username != null or
+        sender_display_name != null;
+    const has_scope = account_id != null or peer_id != null or group_id != null or is_group != null;
+    if (channel == null and !has_sender_identity and !has_scope) return null;
+
+    return .{
+        .channel = channel,
+        .account_id = account_id,
+        .sender_number = sender_number,
+        .sender_uuid = sender_uuid,
+        .sender_name = sender_name,
+        .sender_id = sender_id,
+        .sender_username = sender_username,
+        .sender_display_name = sender_display_name,
+        .peer_id = peer_id,
+        .group_id = group_id,
+        .is_group = is_group,
+    };
+}
+
+fn normalizeOptionalString(value: ?[]const u8) ?[]const u8 {
+    return if (value) |slice|
+        if (slice.len > 0) slice else null
+    else
+        null;
+}
+
 /// Context passed to prompt sections during construction.
 pub const PromptContext = struct {
     workspace_dir: []const u8,
