@@ -255,6 +255,7 @@ pub const Agent = struct {
     model_fallbacks: []const config_types.ModelFallbackEntry = &.{},
     temperature: f64,
     workspace_dir: []const u8,
+    workspace_dir_owned: bool = false,
     allowed_paths: []const []const u8 = &.{},
     multimodal_unrestricted: bool = false,
     /// List of models that do not support image/vision input.
@@ -437,11 +438,22 @@ pub const Agent = struct {
             };
         }
 
+        var effective_workspace_dir = cfg.workspace_dir;
+        var workspace_dir_owned = false;
+        if (profile) |agent_profile| {
+            if (agent_profile.workspace_path) |workspace_path| {
+                effective_workspace_dir = try cfg.resolveAgentWorkspacePath(allocator, workspace_path);
+                workspace_dir_owned = true;
+                errdefer if (workspace_dir_owned) allocator.free(effective_workspace_dir);
+                Config.scaffoldAgentWorkspace(allocator, effective_workspace_dir) catch {};
+            }
+        }
+
         const bootstrap_provider: ?bootstrap_mod.BootstrapProvider = bootstrap_mod.createProvider(
             allocator,
             cfg.memory.backend,
             mem,
-            cfg.workspace_dir,
+            effective_workspace_dir,
         ) catch null;
 
         return .{
@@ -462,7 +474,8 @@ pub const Agent = struct {
             .fallback_providers = cfg.reliability.fallback_providers,
             .model_fallbacks = cfg.reliability.model_fallbacks,
             .temperature = if (profile) |agent_profile| agent_profile.temperature orelse cfg.default_temperature else cfg.default_temperature,
-            .workspace_dir = cfg.workspace_dir,
+            .workspace_dir = effective_workspace_dir,
+            .workspace_dir_owned = workspace_dir_owned,
             .allowed_paths = cfg.autonomy.allowed_paths,
             .multimodal_unrestricted = cfg.autonomy.level == .yolo,
             .vision_disabled_models = cfg.agent.vision_disabled_models,
@@ -498,6 +511,7 @@ pub const Agent = struct {
         if (self.bootstrap) |bp| bp.deinit();
         if (self.model_name_owned) self.allocator.free(self.model_name);
         if (self.default_provider_owned) self.allocator.free(self.default_provider);
+        if (self.workspace_dir_owned) self.allocator.free(self.workspace_dir);
         if (self.system_prompt_model_name) |model| self.allocator.free(model);
         if (self.last_route_trace) |trace| self.allocator.free(trace);
         if (self.exec_node_id_owned and self.exec_node_id != null) self.allocator.free(self.exec_node_id.?);
@@ -1634,7 +1648,7 @@ pub const Agent = struct {
                     if (mem.store(key, effective_user_message, .conversation, self.memory_session_id)) |_| {
                         // Vector sync after auto-save
                         if (self.mem_rt) |rt| {
-                            rt.syncVectorAfterStore(self.allocator, key, effective_user_message);
+                            rt.syncVectorAfterStore(self.allocator, key, effective_user_message, self.memory_session_id);
                         }
                     } else |_| {}
                 }
@@ -2134,7 +2148,7 @@ pub const Agent = struct {
                             if (mem.store(key, summary, .conversation, self.memory_session_id)) |_| {
                                 // Vector sync after auto-save
                                 if (self.mem_rt) |rt| {
-                                    rt.syncVectorAfterStore(self.allocator, key, summary);
+                                    rt.syncVectorAfterStore(self.allocator, key, summary, self.memory_session_id);
                                 }
                             } else |_| {}
                         }
@@ -2578,6 +2592,8 @@ pub const Agent = struct {
                 defer tools_mod.process_util.setThreadInterruptFlag(null);
                 @import("../http_util.zig").setThreadInterruptFlag(&self.interrupt_requested);
                 defer @import("../http_util.zig").setThreadInterruptFlag(null);
+                const previous_memory_session_id = tools_mod.setThreadMemorySessionId(self.memory_session_id);
+                defer _ = tools_mod.setThreadMemorySessionId(previous_memory_session_id);
                 const result = t.execute(tool_allocator, args) catch |err| {
                     if (verbose_mod.isVerbose()) {
                         log.info("tool result: name={s} error={s}", .{ call.name, @errorName(err) });
@@ -2602,9 +2618,8 @@ pub const Agent = struct {
                     } else {
                         const error_msg = result.error_msg orelse result.output;
                         const error_preview = if (error_msg.len > 256) error_msg[0..256] else error_msg;
-                        log.info("tool result: name={s} success={} error={s}", .{ call.name, result.success, error_preview});
+                        log.info("tool result: name={s} success={} error={s}", .{ call.name, result.success, error_preview });
                     }
-                    
                 }
                 return .{
                     .name = call.name,

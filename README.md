@@ -50,7 +50,7 @@ Local machine benchmark (macOS arm64, Feb 2026), normalized for 0.8 GHz edge har
 | **Language** | TypeScript | Python | Go | Rust | **Zig** |
 | **RAM** | > 1 GB | > 100 MB | < 10 MB | < 5 MB | **~1 MB** |
 | **Startup (0.8 GHz)** | > 500 s | > 30 s | < 1 s | < 10 ms | **< 8 ms** |
-| **Binary Size** | ~28 MB (dist) | N/A (Scripts) | ~8 MB | 3.4 MB | **678 KB** |
+| **Binary Size** | ~28 MB (dist) | N/A (Scripts) | ~8 MB | ~8.8 MB | **678 KB** |
 | **Tests** | — | — | — | 1,017 | **5,300+** |
 | **Source Files** | ~400+ | — | — | ~120 | **~230** |
 | **Cost** | Mac Mini $599 | Linux SBC ~$50 | Linux Board $10 | Any $10 hardware | **Any $5 hardware** |
@@ -191,6 +191,7 @@ nullclaw channel start discord
 nullclaw channel start signal
 
 # Manage background service
+# Linux supports systemd user services and OpenRC
 nullclaw service install
 nullclaw service status
 
@@ -521,6 +522,10 @@ Example:
 In that setup, topic `42` routes to `coder`, while the rest of the forum falls back to `orchestrator`.
 
 Named agent profiles are configured separately from bindings. Bindings only choose which named agent handles a given chat/topic.
+
+If a named agent should run from its own workspace, set `agents.list[].workspace_path`.
+Relative paths are resolved from the directory that contains `config.json`, the workspace is scaffolded on first use, and the agent gets a durable memory namespace `agent:<agent-id>`.
+This applies to `nullclaw agent --agent <id>`, `/subagents spawn --agent <id>`, and routed sessions resolved through `bindings`.
 
 Minimal end-to-end example:
 

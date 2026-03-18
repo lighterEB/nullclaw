@@ -65,9 +65,15 @@ pub const AudioMediaConfig = struct {
 // ── Sub-config structs ──────────────────────────────────────────
 
 pub const DiagnosticsConfig = struct {
+    pub const OtelHeaderEntry = struct {
+        key: []const u8,
+        value: []const u8,
+    };
+
     backend: []const u8 = "none",
     otel_endpoint: ?[]const u8 = null,
     otel_service_name: ?[]const u8 = null,
+    otel_headers: []const OtelHeaderEntry = &.{},
     /// Optional max length for user-visible provider/API errors after scrubbing.
     /// If null, uses env var NULLCLAW_MAX_ERROR_CHARS (or built-in default).
     api_error_max_chars: ?u32 = null,
@@ -400,7 +406,9 @@ pub const MatrixConfig = struct {
     user_id: ?[]const u8 = null,
     allow_from: []const []const u8 = &.{},
     group_allow_from: []const []const u8 = &.{},
+    dm_policy: []const u8 = "allowlist",
     group_policy: []const u8 = "allowlist",
+    require_mention: bool = false,
 };
 
 pub const MattermostConfig = struct {
@@ -747,6 +755,50 @@ pub const NostrConfig = struct {
     config_dir: []const u8 = ".",
 };
 
+pub const ExternalChannelConfig = struct {
+    pub const EnvEntry = struct {
+        key: []const u8,
+        value: []const u8,
+    };
+
+    pub const TransportConfig = struct {
+        command: []const u8 = "",
+        args: []const []const u8 = &.{},
+        env: []const EnvEntry = &.{},
+        timeout_ms: u32 = 10_000,
+    };
+
+    account_id: []const u8 = "default",
+    /// Runtime channel identifier exposed inside nullclaw routing and bindings.
+    /// Example: "whatsapp_web"
+    runtime_name: []const u8 = "",
+    /// Plugin process transport configuration (JSON-RPC over stdio).
+    transport: TransportConfig = .{},
+    /// Raw JSON object forwarded as params.config during the start request.
+    plugin_config_json: []const u8 = "{}",
+    /// Runtime-only host-owned state directory for plugin persistence.
+    /// Backfilled by Config.load(); never serialized.
+    state_dir: []const u8 = ".",
+
+    pub fn isValidRuntimeName(raw: []const u8) bool {
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        if (trimmed.len == 0 or trimmed.len > 128) return false;
+        for (trimmed) |ch| {
+            if (std.ascii.isAlphanumeric(ch) or ch == '_' or ch == '-' or ch == '.') continue;
+            return false;
+        }
+        return true;
+    }
+
+    pub fn hasCommand(raw: []const u8) bool {
+        return std.mem.trim(u8, raw, " \t\r\n").len > 0;
+    }
+
+    pub fn isValidTimeoutMs(timeout_ms: u32) bool {
+        return timeout_ms >= 1 and timeout_ms <= 600_000;
+    }
+};
+
 pub const ChannelsConfig = struct {
     cli: bool = true,
     telegram: []const TelegramConfig = &.{},
@@ -769,6 +821,7 @@ pub const ChannelsConfig = struct {
     maixcam: []const MaixCamConfig = &.{},
     web: []const WebConfig = &.{},
     max: []const MaxConfig = &.{},
+    external: []const ExternalChannelConfig = &.{},
     nostr: ?*NostrConfig = null,
 
     fn primaryAccount(comptime T: type, items: []const T) ?T {
@@ -842,6 +895,9 @@ pub const ChannelsConfig = struct {
     }
     pub fn maxPrimary(self: *const ChannelsConfig) ?MaxConfig {
         return primaryAccount(MaxConfig, self.max);
+    }
+    pub fn externalPrimary(self: *const ChannelsConfig) ?ExternalChannelConfig {
+        return primaryAccount(ExternalChannelConfig, self.external);
     }
 };
 
@@ -1404,6 +1460,7 @@ pub const NamedAgentConfig = struct {
     system_prompt: ?[]const u8 = null,
     /// Runtime-only source path preserved so Config.save() can round-trip file-backed prompts.
     system_prompt_path: ?[]const u8 = null,
+    workspace_path: ?[]const u8 = null,
     api_key: ?[]const u8 = null,
     temperature: ?f64 = null,
     max_depth: u32 = 3,
@@ -1522,6 +1579,18 @@ pub const SessionConfig = struct {
     dm_scope: DmScope = .per_channel_peer,
     idle_minutes: u32 = 60,
     identity_links: []const IdentityLink = &.{},
+    /// Automatically route direct messages from unknown peers into deterministic
+    /// per-peer agent IDs (agent runtime/workspace/memory isolation).
+    auto_provision_direct_agents: bool = false,
+    /// Optional HMAC secret used to verify `/claim <token>` identity assertions.
+    /// When unset, direct-peer auto-provisioning is not gated by identity claims.
+    claim_secret: ?[]const u8 = null,
+    /// Optional shared secret for manual `/revoke <admin-secret>` operations.
+    claim_admin_secret: ?[]const u8 = null,
+    /// Failed `/claim` attempts allowed before lockout kicks in.
+    claim_max_attempts: u32 = 5,
+    /// Lockout duration in seconds after too many failed claim attempts.
+    claim_lockout_secs: u32 = 300,
     typing_interval_secs: u32 = 5,
     /// Maximum concurrent message processing tasks per channel.
     /// When set to 0 or 1, messages are processed sequentially.
