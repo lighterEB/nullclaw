@@ -1153,6 +1153,7 @@ fn parseInvokeTagCall(allocator: std.mem.Allocator, inner: []const u8) !ParsedTo
     const name_end = std.mem.indexOfScalar(u8, after_prefix[1..], name_quote) orelse return error.InvalidInvokeFormat;
     const tool_name = std.mem.trim(u8, after_prefix[1 .. name_end + 1], " \t\r\n");
     if (tool_name.len == 0) return error.EmptyToolName;
+    if (!isPlausibleToolName(tool_name)) return error.InvalidToolName;
 
     const invoke_close_tag = "</invoke>";
     // Look for the '>' that closes the <invoke ...> tag.
@@ -2828,6 +2829,29 @@ test "parseXmlToolCalls minimax format robustness" {
     try std.testing.expectEqual(@as(usize, 1), result.calls.len);
     try std.testing.expectEqualStrings("shell", result.calls[0].name);
     try std.testing.expect(std.mem.indexOf(u8, result.calls[0].arguments_json, "ls -la") != null);
+}
+
+test "parseXmlToolCalls rejects invalid minimax tool name" {
+    const allocator = std.testing.allocator;
+    const response =
+        \\<tool_call>
+        \\<invoke name=":">
+        \\<parameter name="command">ls</parameter>
+        \\</invoke>
+        \\</tool_call>
+    ;
+
+    const result = try parseToolCalls(allocator, response);
+    defer {
+        allocator.free(result.text);
+        for (result.calls) |call| {
+            allocator.free(call.name);
+            allocator.free(call.arguments_json);
+        }
+        allocator.free(result.calls);
+    }
+
+    try std.testing.expectEqual(@as(usize, 0), result.calls.len);
 }
 
 test "parseXmlToolCalls hybrid format" {
