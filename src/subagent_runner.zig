@@ -135,6 +135,8 @@ pub fn runTaskWithTools(
         "{s}\n\n{s}",
         .{ request.system_prompt, tool_instructions },
     );
+    // After append, ownership transfers to agent.history; agent.deinit() frees it.
+    // Use catch to free only if append itself fails (avoids double-free with deinit).
     agent.history.append(allocator, .{
         .role = .system,
         .content = full_system,
