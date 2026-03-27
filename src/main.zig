@@ -2651,6 +2651,28 @@ fn hasReliabilityCredentialFallback(allocator: std.mem.Allocator, config: *const
     return false;
 }
 
+fn hasChannelStartupCredentials(
+    allocator: std.mem.Allocator,
+    config: *const yc.config.Config,
+    resolved_api_key: ?[]const u8,
+) bool {
+    if (resolved_api_key != null) return true;
+    if (yc.providers.classifyProvider(config.default_provider) == .openai_codex_provider) return true;
+    return hasReliabilityCredentialFallback(allocator, config);
+}
+
+fn ensureChannelStartupCredentials(
+    allocator: std.mem.Allocator,
+    config: *const yc.config.Config,
+    resolved_api_key: ?[]const u8,
+) void {
+    if (hasChannelStartupCredentials(allocator, config, resolved_api_key)) return;
+
+    std.debug.print("No API key configured. Set env var or add to ~/.nullclaw/config.json:\n", .{});
+    std.debug.print("  \"providers\": {{ \"{s}\": {{ \"api_key\": \"...\" }} }}\n", .{config.default_provider});
+    std.process.exit(1);
+}
+
 fn runSignalChannel(allocator: std.mem.Allocator, args: []const []const u8, config: *const yc.config.Config, signal_config: yc.config.SignalConfig) !void {
     _ = args;
     if (!build_options.enable_channel_signal) {
@@ -2666,14 +2688,7 @@ fn runSignalChannel(allocator: std.mem.Allocator, args: []const []const u8, conf
     ) catch null;
     defer if (resolved_api_key) |k| allocator.free(k);
 
-    // OAuth providers (openai-codex) don't need an API key
-    const provider_kind = yc.providers.classifyProvider(config.default_provider);
-    const has_fallback_credentials = hasReliabilityCredentialFallback(allocator, config);
-    if (resolved_api_key == null and provider_kind != .openai_codex_provider and !has_fallback_credentials) {
-        std.debug.print("No API key configured. Set env var or add to ~/.nullclaw/config.json:\n", .{});
-        std.debug.print("  \"providers\": {{ \"{s}\": {{ \"api_key\": \"...\" }} }}\n", .{config.default_provider});
-        std.process.exit(1);
-    }
+    ensureChannelStartupCredentials(allocator, config, resolved_api_key);
 
     const temperature = config.default_temperature;
 
@@ -2874,6 +2889,14 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
         user_list.items
     else
         telegram_config.allow_from;
+
+    const resolved_api_key = yc.providers.resolveApiKeyFromConfig(
+        allocator,
+        config.default_provider,
+        config.providers,
+    ) catch null;
+    defer if (resolved_api_key) |k| allocator.free(k);
+    ensureChannelStartupCredentials(allocator, &config, resolved_api_key);
 
     std.debug.print("nullclaw telegram bot starting...\n", .{});
     config.printModelConfig();
@@ -3587,6 +3610,56 @@ test "hasConfiguredButBuildDisabledStartableChannels detects configured disabled
     };
 
     try std.testing.expectEqual(!yc.channel_catalog.isBuildEnabled(.telegram), hasConfiguredButBuildDisabledStartableChannels(&cfg));
+}
+
+test "hasChannelStartupCredentials accepts resolved primary key" {
+    const cfg = yc.config.Config{
+        .workspace_dir = "/tmp/nullclaw-test",
+        .config_path = "/tmp/nullclaw-test/config.json",
+        .default_provider = "anthropic",
+        .default_model = "anthropic/claude-3-7-sonnet",
+        .allocator = std.testing.allocator,
+    };
+
+    try std.testing.expect(hasChannelStartupCredentials(std.testing.allocator, &cfg, "sk-test"));
+}
+
+test "hasChannelStartupCredentials accepts openai codex without api key" {
+    const cfg = yc.config.Config{
+        .workspace_dir = "/tmp/nullclaw-test",
+        .config_path = "/tmp/nullclaw-test/config.json",
+        .default_provider = "openai-codex",
+        .default_model = "openai-codex/gpt-5",
+        .allocator = std.testing.allocator,
+    };
+
+    try std.testing.expect(hasChannelStartupCredentials(std.testing.allocator, &cfg, null));
+}
+
+test "hasChannelStartupCredentials accepts reliability fallback credentials" {
+    var cfg = yc.config.Config{
+        .workspace_dir = "/tmp/nullclaw-test",
+        .config_path = "/tmp/nullclaw-test/config.json",
+        .default_provider = "anthropic",
+        .default_model = "anthropic/claude-3-7-sonnet",
+        .allocator = std.testing.allocator,
+    };
+    cfg.reliability.api_keys = &.{"rotating-key"};
+
+    try std.testing.expect(hasChannelStartupCredentials(std.testing.allocator, &cfg, null));
+}
+
+test "hasChannelStartupCredentials rejects missing provider and fallback credentials" {
+    // Regression: Telegram startup must still fail fast after converging onto ChannelRuntime.
+    const cfg = yc.config.Config{
+        .workspace_dir = "/tmp/nullclaw-test",
+        .config_path = "/tmp/nullclaw-test/config.json",
+        .default_provider = "anthropic",
+        .default_model = "anthropic/claude-3-7-sonnet",
+        .allocator = std.testing.allocator,
+    };
+
+    try std.testing.expect(!hasChannelStartupCredentials(std.testing.allocator, &cfg, null));
 }
 
 test "parseCronAddAgentOptions preserves delivery account flag" {
