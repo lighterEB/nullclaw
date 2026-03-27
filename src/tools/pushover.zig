@@ -13,12 +13,12 @@ const PUSHOVER_API_URL = "https://api.pushover.net/1/messages.json";
 
 /// Pushover push notification tool.
 /// Sends notifications via the Pushover API. Requires PUSHOVER_TOKEN and
-/// PUSHOVER_USER_KEY in the workspace .env file.
+/// PUSHOVER_USER_KEY in the process environment or workspace .env file.
 pub const PushoverTool = struct {
     workspace_dir: []const u8,
 
     pub const tool_name = "pushover";
-    pub const tool_description = "Send a push notification via Pushover. Requires PUSHOVER_TOKEN and PUSHOVER_USER_KEY in .env file.";
+    pub const tool_description = "Send a push notification via Pushover. Requires PUSHOVER_TOKEN and PUSHOVER_USER_KEY in the environment or .env file.";
     pub const tool_params =
         \\{"type":"object","properties":{"message":{"type":"string","description":"The notification message"},"title":{"type":"string","description":"Optional title"},"priority":{"type":"integer","description":"Priority -2..2 (default 0)"},"sound":{"type":"string","description":"Optional sound name"}},"required":["message"]}
     ;
@@ -50,9 +50,9 @@ pub const PushoverTool = struct {
             }
         }
 
-        // Load credentials from .env
+        // Load credentials from the process environment or workspace .env file.
         const creds = getCredentials(self, allocator) catch
-            return ToolResult.fail("Failed to load Pushover credentials from .env file");
+            return ToolResult.fail("Failed to load Pushover credentials from environment or .env file");
         defer allocator.free(creds.token);
         defer allocator.free(creds.user_key);
 
@@ -137,6 +137,8 @@ pub const PushoverTool = struct {
         // 1. Try process environment first
         token = platform.getEnvOrNull(allocator, "PUSHOVER_TOKEN");
         user_key = platform.getEnvOrNull(allocator, "PUSHOVER_USER_KEY");
+        const token_from_env = token != null;
+        const user_key_from_env = user_key != null;
 
         // 2. Fall back to .env if missing either
         if (token == null or user_key == null) {
@@ -161,16 +163,26 @@ pub const PushoverTool = struct {
                         const key = std.mem.trim(u8, line[0..eq_pos], " \t");
                         const value = parseEnvValue(line[eq_pos + 1 ..]);
 
-                        if (token == null and std.mem.eql(u8, key, "PUSHOVER_TOKEN")) {
+                        if (std.mem.eql(u8, key, "PUSHOVER_TOKEN")) {
+                            if (token_from_env) continue;
+                            const old = token;
+                            token = null;
+                            if (old) |o| allocator.free(o);
                             token = try allocator.dupe(u8, value);
-                        } else if (user_key == null and std.mem.eql(u8, key, "PUSHOVER_USER_KEY")) {
+                        } else if (std.mem.eql(u8, key, "PUSHOVER_USER_KEY")) {
+                            if (user_key_from_env) continue;
+                            const old = user_key;
+                            user_key = null;
+                            if (old) |o| allocator.free(o);
                             user_key = try allocator.dupe(u8, value);
                         }
                     }
                 }
             } else |err| switch (err) {
-                // Ignore missing .env file. We'll return MissingPushover* below.
-                error.FileNotFound => {},
+                // Preserve the previous error if no credentials exist anywhere.
+                error.FileNotFound => {
+                    if (!token_from_env and !user_key_from_env) return error.EnvFileNotFound;
+                },
                 // Propagate other errors (e.g. OutOfMemory, PermissionDenied)
                 else => return err,
             }
@@ -182,6 +194,63 @@ pub const PushoverTool = struct {
         return .{ .token = t, .user_key = u };
     }
 };
+
+const env_c = @cImport({
+    @cInclude("stdlib.h");
+});
+
+const PushoverEnvGuard = struct {
+    allocator: std.mem.Allocator,
+    token: ?[]const u8,
+    user_key: ?[]const u8,
+
+    fn init(allocator: std.mem.Allocator) !PushoverEnvGuard {
+        var guard = PushoverEnvGuard{
+            .allocator = allocator,
+            .token = platform.getEnvOrNull(allocator, "PUSHOVER_TOKEN"),
+            .user_key = platform.getEnvOrNull(allocator, "PUSHOVER_USER_KEY"),
+        };
+        errdefer guard.deinit();
+        errdefer guard.restore() catch {};
+
+        try setProcessEnv(allocator, "PUSHOVER_TOKEN", null);
+        try setProcessEnv(allocator, "PUSHOVER_USER_KEY", null);
+        return guard;
+    }
+
+    fn restore(self: *const PushoverEnvGuard) !void {
+        try setProcessEnv(self.allocator, "PUSHOVER_TOKEN", self.token);
+        try setProcessEnv(self.allocator, "PUSHOVER_USER_KEY", self.user_key);
+    }
+
+    fn deinit(self: *PushoverEnvGuard) void {
+        if (self.token) |value| self.allocator.free(value);
+        if (self.user_key) |value| self.allocator.free(value);
+    }
+};
+
+fn setProcessEnv(allocator: std.mem.Allocator, name: []const u8, value: ?[]const u8) !void {
+    const name_z = try allocator.dupeZ(u8, name);
+    defer allocator.free(name_z);
+
+    const rc: c_int = if (value) |env_value| blk: {
+        const value_z = try allocator.dupeZ(u8, env_value);
+        defer allocator.free(value_z);
+        break :blk if (comptime builtin.os.tag == .windows)
+            env_c._putenv_s(name_z.ptr, value_z.ptr)
+        else
+            env_c.setenv(name_z.ptr, value_z.ptr, 1);
+    } else if (comptime builtin.os.tag == .windows)
+        env_c._putenv_s(name_z.ptr, "")
+    else
+        env_c.unsetenv(name_z.ptr);
+
+    if (rc != 0) return error.EnvMutationFailed;
+}
+
+fn restorePushoverEnvOrPanic(guard: *const PushoverEnvGuard) void {
+    guard.restore() catch @panic("failed to restore Pushover environment");
+}
 
 // ── Tests ───────────────────────────────────────────────────────────
 
@@ -242,7 +311,16 @@ test "pushover priority 5 rejected" {
 }
 
 test "pushover priority 2 accepted (credential error expected)" {
-    var pt = PushoverTool{ .workspace_dir = "/nonexistent_pushover_test_dir" };
+    var env_guard = try PushoverEnvGuard.init(std.testing.allocator);
+    defer env_guard.deinit();
+    defer restorePushoverEnvOrPanic(&env_guard);
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const abs_path = try tmp_dir.dir.realpath(".", &path_buf);
+
+    var pt = PushoverTool{ .workspace_dir = abs_path };
     const t = pt.tool();
     const parsed = try root.parseTestArgs("{\"message\": \"hello\", \"priority\": 2}");
     defer parsed.deinit();
@@ -254,7 +332,16 @@ test "pushover priority 2 accepted (credential error expected)" {
 }
 
 test "pushover priority -2 accepted (credential error expected)" {
-    var pt = PushoverTool{ .workspace_dir = "/nonexistent_pushover_test_dir" };
+    var env_guard = try PushoverEnvGuard.init(std.testing.allocator);
+    defer env_guard.deinit();
+    defer restorePushoverEnvOrPanic(&env_guard);
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const abs_path = try tmp_dir.dir.realpath(".", &path_buf);
+
+    var pt = PushoverTool{ .workspace_dir = abs_path };
     const t = pt.tool();
     const parsed = try root.parseTestArgs("{\"message\": \"hello\", \"priority\": -2}");
     defer parsed.deinit();
@@ -293,6 +380,10 @@ test "pushover schema has priority and sound" {
 }
 
 test "getCredentials reads token and user_key from .env file" {
+    var env_guard = try PushoverEnvGuard.init(std.testing.allocator);
+    defer env_guard.deinit();
+    defer restorePushoverEnvOrPanic(&env_guard);
+
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
     try tmp_dir.dir.writeFile(.{ .sub_path = ".env", .data = 
@@ -313,6 +404,10 @@ test "getCredentials reads token and user_key from .env file" {
 }
 
 test "getCredentials reads exported and quoted values" {
+    var env_guard = try PushoverEnvGuard.init(std.testing.allocator);
+    defer env_guard.deinit();
+    defer restorePushoverEnvOrPanic(&env_guard);
+
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
     try tmp_dir.dir.writeFile(.{ .sub_path = ".env", .data = 
@@ -333,6 +428,10 @@ test "getCredentials reads exported and quoted values" {
 }
 
 test "getCredentials missing token returns error" {
+    var env_guard = try PushoverEnvGuard.init(std.testing.allocator);
+    defer env_guard.deinit();
+    defer restorePushoverEnvOrPanic(&env_guard);
+
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
     try tmp_dir.dir.writeFile(.{ .sub_path = ".env", .data = "PUSHOVER_USER_KEY=only-user-key\n" });
@@ -346,6 +445,10 @@ test "getCredentials missing token returns error" {
 }
 
 test "getCredentials missing user_key returns error" {
+    var env_guard = try PushoverEnvGuard.init(std.testing.allocator);
+    defer env_guard.deinit();
+    defer restorePushoverEnvOrPanic(&env_guard);
+
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
     try tmp_dir.dir.writeFile(.{ .sub_path = ".env", .data = "PUSHOVER_TOKEN=only-token\n" });
@@ -359,20 +462,96 @@ test "getCredentials missing user_key returns error" {
 }
 
 test "getCredentials missing .env returns error" {
+    var env_guard = try PushoverEnvGuard.init(std.testing.allocator);
+    defer env_guard.deinit();
+    defer restorePushoverEnvOrPanic(&env_guard);
+
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const abs_path = try tmp_dir.dir.realpath(".", &path_buf);
 
     var pt = PushoverTool{ .workspace_dir = abs_path };
-    
-    // In CI these won't be set, but locally they might be.
-    // We cannot easily unset them portably without C, so we just hope 
-    // the environment is clean or the test runner isolates it.
-    // Actually, if we use a real path but NO .env file, readFileAlloc returns FileNotFound.
-
     const result = pt.getCredentials(std.testing.allocator);
-    // It might return MissingPushoverToken if it falls through or if it finds nothing in env.
-    const err = result catch |e| e;
-    try std.testing.expect(err == error.MissingPushoverToken or err == error.MissingPushoverUserKey);
+    try std.testing.expectError(error.EnvFileNotFound, result);
+}
+
+test "getCredentials prefers process environment over .env file" {
+    var env_guard = try PushoverEnvGuard.init(std.testing.allocator);
+    defer env_guard.deinit();
+    defer restorePushoverEnvOrPanic(&env_guard);
+
+    try setProcessEnv(std.testing.allocator, "PUSHOVER_TOKEN", "env-token");
+    try setProcessEnv(std.testing.allocator, "PUSHOVER_USER_KEY", "env-user-key");
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    try tmp_dir.dir.writeFile(.{ .sub_path = ".env", .data = 
+        \\PUSHOVER_TOKEN=file-token
+        \\PUSHOVER_USER_KEY=file-user-key
+    });
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const abs_path = try tmp_dir.dir.realpath(".", &path_buf);
+
+    var pt = PushoverTool{ .workspace_dir = abs_path };
+    const creds = try pt.getCredentials(std.testing.allocator);
+    defer std.testing.allocator.free(creds.token);
+    defer std.testing.allocator.free(creds.user_key);
+
+    try std.testing.expectEqualStrings("env-token", creds.token);
+    try std.testing.expectEqualStrings("env-user-key", creds.user_key);
+}
+
+test "getCredentials fills missing environment value from .env file" {
+    var env_guard = try PushoverEnvGuard.init(std.testing.allocator);
+    defer env_guard.deinit();
+    defer restorePushoverEnvOrPanic(&env_guard);
+
+    try setProcessEnv(std.testing.allocator, "PUSHOVER_TOKEN", "env-token");
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    try tmp_dir.dir.writeFile(.{ .sub_path = ".env", .data = 
+        \\PUSHOVER_TOKEN=file-token
+        \\PUSHOVER_USER_KEY=file-user-key
+    });
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const abs_path = try tmp_dir.dir.realpath(".", &path_buf);
+
+    var pt = PushoverTool{ .workspace_dir = abs_path };
+    const creds = try pt.getCredentials(std.testing.allocator);
+    defer std.testing.allocator.free(creds.token);
+    defer std.testing.allocator.free(creds.user_key);
+
+    try std.testing.expectEqualStrings("env-token", creds.token);
+    try std.testing.expectEqualStrings("file-user-key", creds.user_key);
+}
+
+test "getCredentials later .env entries override earlier ones" {
+    var env_guard = try PushoverEnvGuard.init(std.testing.allocator);
+    defer env_guard.deinit();
+    defer restorePushoverEnvOrPanic(&env_guard);
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    try tmp_dir.dir.writeFile(.{ .sub_path = ".env", .data = 
+        \\PUSHOVER_TOKEN=first-token
+        \\PUSHOVER_TOKEN=second-token
+        \\PUSHOVER_USER_KEY=first-user-key
+        \\PUSHOVER_USER_KEY=second-user-key
+    });
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const abs_path = try tmp_dir.dir.realpath(".", &path_buf);
+
+    var pt = PushoverTool{ .workspace_dir = abs_path };
+    const creds = try pt.getCredentials(std.testing.allocator);
+    defer std.testing.allocator.free(creds.token);
+    defer std.testing.allocator.free(creds.user_key);
+
+    // Regression: env fallback should preserve dotenv's last-value-wins behavior.
+    try std.testing.expectEqualStrings("second-token", creds.token);
+    try std.testing.expectEqualStrings("second-user-key", creds.user_key);
 }
