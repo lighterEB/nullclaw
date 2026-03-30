@@ -29,6 +29,7 @@ const ConversationContext = @import("agent/prompt.zig").ConversationContext;
 const buildConversationContext = @import("agent/prompt.zig").buildConversationContext;
 const thread_stacks = @import("thread_stacks.zig");
 const tunnel_mod = @import("tunnel.zig");
+const Atomic = @import("portable_atomic.zig").Atomic;
 
 const log = std.log.scoped(.daemon);
 
@@ -41,8 +42,7 @@ const HEARTBEAT_THREAD_STACK_SIZE: usize = thread_stacks.SESSION_TURN_STACK_SIZE
 
 /// Maximum number of supervised components.
 const MAX_COMPONENTS: usize = 8;
-var outbound_draft_id_counter: u64 = 1;
-var outbound_draft_id_mutex: std.Thread.Mutex = .{};
+var outbound_draft_id_counter: Atomic(u64) = Atomic(u64).init(1);
 
 /// Component status for state file serialization.
 pub const ComponentStatus = struct {
@@ -323,6 +323,7 @@ fn upsertSchedulerRuntimeJob(
         dst.last_status = runtime_job.last_status;
         dst.paused = runtime_job.paused;
         dst.one_shot = runtime_job.one_shot;
+        dst.session_target = runtime_job.session_target;
         // Update delivery config
         dst.delivery.mode = runtime_job.delivery.mode;
         if (dst.delivery.channel_owned) {
@@ -330,11 +331,27 @@ fn upsertSchedulerRuntimeJob(
         }
         dst.delivery.channel = if (runtime_job.delivery.channel) |c| try allocator.dupe(u8, c) else null;
         dst.delivery.channel_owned = runtime_job.delivery.channel != null;
+        if (dst.delivery.account_id_owned) {
+            if (dst.delivery.account_id) |account_id| allocator.free(account_id);
+        }
+        dst.delivery.account_id = if (runtime_job.delivery.account_id) |account_id| try allocator.dupe(u8, account_id) else null;
+        dst.delivery.account_id_owned = runtime_job.delivery.account_id != null;
         if (dst.delivery.to_owned) {
             if (dst.delivery.to) |t| allocator.free(t);
         }
         dst.delivery.to = if (runtime_job.delivery.to) |t| try allocator.dupe(u8, t) else null;
         dst.delivery.to_owned = runtime_job.delivery.to != null;
+        if (dst.delivery.peer_id_owned) {
+            if (dst.delivery.peer_id) |peer_id| allocator.free(peer_id);
+        }
+        dst.delivery.peer_kind = runtime_job.delivery.peer_kind;
+        dst.delivery.peer_id = if (runtime_job.delivery.peer_id) |peer_id| try allocator.dupe(u8, peer_id) else null;
+        dst.delivery.peer_id_owned = runtime_job.delivery.peer_id != null;
+        if (dst.delivery.thread_id_owned) {
+            if (dst.delivery.thread_id) |thread_id| allocator.free(thread_id);
+        }
+        dst.delivery.thread_id = if (runtime_job.delivery.thread_id) |thread_id| try allocator.dupe(u8, thread_id) else null;
+        dst.delivery.thread_id_owned = runtime_job.delivery.thread_id != null;
         dst.delivery.best_effort = runtime_job.delivery.best_effort;
         return;
     }
@@ -359,10 +376,17 @@ fn upsertSchedulerRuntimeJob(
         .delivery = .{
             .mode = runtime_job.delivery.mode,
             .channel = if (runtime_job.delivery.channel) |c| try allocator.dupe(u8, c) else null,
+            .account_id = if (runtime_job.delivery.account_id) |account_id| try allocator.dupe(u8, account_id) else null,
             .to = if (runtime_job.delivery.to) |t| try allocator.dupe(u8, t) else null,
+            .peer_kind = runtime_job.delivery.peer_kind,
+            .peer_id = if (runtime_job.delivery.peer_id) |peer_id| try allocator.dupe(u8, peer_id) else null,
+            .thread_id = if (runtime_job.delivery.thread_id) |thread_id| try allocator.dupe(u8, thread_id) else null,
             .best_effort = runtime_job.delivery.best_effort,
             .channel_owned = runtime_job.delivery.channel != null,
+            .account_id_owned = runtime_job.delivery.account_id != null,
             .to_owned = runtime_job.delivery.to != null,
+            .peer_id_owned = runtime_job.delivery.peer_id != null,
+            .thread_id_owned = runtime_job.delivery.thread_id != null,
         },
     });
 }
@@ -401,10 +425,12 @@ fn mergeSchedulerTickChangesAndSave(
 /// Scheduler thread — executes due cron jobs and periodically reloads cron.json
 /// so tasks created/updated after daemon startup are picked up without restart.
 fn schedulerThread(allocator: std.mem.Allocator, config: *const Config, state: *DaemonState, event_bus: *bus_mod.Bus) void {
+    const gateway_mod = @import("gateway.zig");
     var scheduler = CronScheduler.init(allocator, config.scheduler.max_tasks, config.scheduler.enabled);
     scheduler.setShellCwd(config.workspace_dir);
     scheduler.setAgentTimeoutSecs(config.scheduler.agent_timeout_secs);
     defer scheduler.deinit();
+    defer gateway_mod.clearSharedScheduler();
     var before_tick: std.StringHashMapUnmanaged(SchedulerJobSnapshot) = .empty;
     defer {
         clearSchedulerSnapshot(allocator, &before_tick);
@@ -416,35 +442,50 @@ fn schedulerThread(allocator: std.mem.Allocator, config: *const Config, state: *
     // Initial load from disk (ignore errors — start empty if file missing/corrupt)
     cron.loadJobs(&scheduler) catch {};
 
+    // Register live scheduler pointer with the gateway for /cron HTTP endpoints.
+    gateway_mod.setSharedScheduler(&scheduler);
+
     state.markRunning("scheduler");
     health.markComponentOk("scheduler");
 
     while (!isShutdownRequested()) {
-        // Refresh scheduler view from store so jobs created/updated after daemon startup are picked up.
-        cron.reloadJobs(&scheduler) catch |err| {
-            log.warn("scheduler reload failed: {}", .{err});
-            state.markError("scheduler", @errorName(err));
-            health.markComponentError("scheduler", @errorName(err));
-        };
+        var snapshot_ok = true;
+        gateway_mod.lockSharedScheduler();
+        {
+            defer gateway_mod.unlockSharedScheduler();
 
-        buildSchedulerSnapshot(allocator, &scheduler, &before_tick) catch |err| {
-            log.warn("scheduler snapshot failed: {}", .{err});
-            state.markError("scheduler", @errorName(err));
-            health.markComponentError("scheduler", @errorName(err));
+            // Refresh scheduler view from store so jobs created/updated after daemon startup are picked up.
+            cron.reloadJobs(&scheduler) catch |err| {
+                log.warn("scheduler reload failed: {}", .{err});
+                state.markError("scheduler", @errorName(err));
+                health.markComponentError("scheduler", @errorName(err));
+            };
+
+            buildSchedulerSnapshot(allocator, &scheduler, &before_tick) catch |err| {
+                log.warn("scheduler snapshot failed: {}", .{err});
+                state.markError("scheduler", @errorName(err));
+                health.markComponentError("scheduler", @errorName(err));
+                snapshot_ok = false;
+            };
+
+            if (snapshot_ok) {
+                const changed = scheduler.tick(std.time.timestamp(), event_bus);
+                if (changed) {
+                    mergeSchedulerTickChangesAndSave(allocator, &scheduler, &before_tick) catch |err| {
+                        log.warn("scheduler merge-save failed: {}", .{err});
+                        state.markError("scheduler", @errorName(err));
+                        health.markComponentError("scheduler", @errorName(err));
+                    };
+                }
+            }
+        }
+
+        if (!snapshot_ok) {
             var snapshot_sleep: u64 = 0;
             while (snapshot_sleep < poll_secs and !isShutdownRequested()) : (snapshot_sleep += 1) {
                 std.Thread.sleep(std.time.ns_per_s);
             }
             continue;
-        };
-
-        const changed = scheduler.tick(std.time.timestamp(), event_bus);
-        if (changed) {
-            mergeSchedulerTickChangesAndSave(allocator, &scheduler, &before_tick) catch |err| {
-                log.warn("scheduler merge-save failed: {}", .{err});
-                state.markError("scheduler", @errorName(err));
-                health.markComponentError("scheduler", @errorName(err));
-            };
         }
 
         state.markRunning("scheduler");
@@ -663,6 +704,62 @@ fn resolveInboundRouteSessionKeyWithMetadata(
     return route.session_key;
 }
 
+fn resolveInboundMainSessionKeyWithMetadata(
+    allocator: std.mem.Allocator,
+    config: *const Config,
+    msg: *const bus_mod.InboundMessage,
+    meta: channel_adapters.InboundMetadata,
+) ?[]const u8 {
+    if (!std.mem.eql(u8, msg.sender_id, "system:cron")) return null;
+
+    const route_desc = channel_adapters.findInboundRouteDescriptor(config, msg.channel);
+
+    const account_id = meta.account_id orelse if (route_desc) |desc|
+        desc.default_account_id(config, msg.channel) orelse "default"
+    else
+        "default";
+
+    const peer = if (meta.peer_kind != null and meta.peer_id != null)
+        agent_routing.PeerRef{ .kind = meta.peer_kind.?, .id = meta.peer_id.? }
+    else if (route_desc) |desc|
+        desc.derive_peer(.{
+            .channel_name = msg.channel,
+            .sender_id = msg.sender_id,
+            .chat_id = msg.chat_id,
+        }, meta) orelse return null
+    else
+        return null;
+
+    if (std.mem.eql(u8, msg.channel, "telegram") and
+        peer.kind == .group and
+        meta.thread_id != null)
+    {
+        const topic_peer_id = std.fmt.allocPrint(allocator, "{s}:thread:{s}", .{ peer.id, meta.thread_id.? }) catch return null;
+        defer allocator.free(topic_peer_id);
+
+        const route = agent_routing.resolveRouteWithSession(allocator, .{
+            .channel = msg.channel,
+            .account_id = account_id,
+            .peer = .{ .kind = peer.kind, .id = topic_peer_id },
+            .parent_peer = peer,
+            .guild_id = meta.guild_id,
+            .team_id = meta.team_id,
+        }, config.agent_bindings, config.agents, config.session) catch return null;
+        allocator.free(route.session_key);
+        return route.main_session_key;
+    }
+
+    const route = agent_routing.resolveRouteWithSession(allocator, .{
+        .channel = msg.channel,
+        .account_id = account_id,
+        .peer = peer,
+        .guild_id = meta.guild_id,
+        .team_id = meta.team_id,
+    }, config.agent_bindings, config.agents, config.session) catch return null;
+    allocator.free(route.session_key);
+    return route.main_session_key;
+}
+
 fn resolveInboundRouteSessionKey(
     allocator: std.mem.Allocator,
     config: *const Config,
@@ -790,11 +887,7 @@ const StreamingOutboundCtx = struct {
 };
 
 fn nextOutboundDraftId() u64 {
-    outbound_draft_id_mutex.lock();
-    defer outbound_draft_id_mutex.unlock();
-    const id = outbound_draft_id_counter;
-    outbound_draft_id_counter += 1;
-    return id;
+    return outbound_draft_id_counter.fetchAdd(1, .monotonic);
 }
 
 fn publishStreamingChunk(ctx_ptr: *anyopaque, event: streaming.Event) void {
@@ -884,7 +977,12 @@ fn inboundDispatcherThread(
         defer parsed_meta.deinit();
 
         const outbound_account_id = parsed_meta.fields.account_id;
-        const routed_session_key = resolveInboundRouteSessionKeyWithMetadata(
+        const routed_session_key = resolveInboundMainSessionKeyWithMetadata(
+            allocator,
+            runtime.config,
+            &msg,
+            parsed_meta.fields,
+        ) orelse resolveInboundRouteSessionKeyWithMetadata(
             allocator,
             runtime.config,
             &msg,
@@ -2220,6 +2318,35 @@ test "makeAssistantReplyOutbound extracts structured choices from assistant repl
     try std.testing.expectEqual(@as(u64, 17), msg.draft_id);
 }
 
+test "nextOutboundDraftId stays unique across concurrent callers" {
+    const Worker = struct {
+        fn run(out: *u64) void {
+            out.* = nextOutboundDraftId();
+        }
+    };
+
+    const previous = outbound_draft_id_counter.swap(1, .monotonic);
+    defer _ = outbound_draft_id_counter.swap(previous, .monotonic);
+
+    var results: [8]u64 = undefined;
+    var threads: [results.len]std.Thread = undefined;
+    const max_id: u64 = results.len;
+
+    for (&results, 0..) |*result, i| {
+        threads[i] = try std.Thread.spawn(.{}, Worker.run, .{result});
+    }
+    for (threads) |thread| thread.join();
+
+    var seen: [results.len + 1]bool = [_]bool{false} ** (results.len + 1);
+    for (results) |id| {
+        // Regression: daemon draft IDs must remain unique after replacing the
+        // mutex-protected counter with portable atomic access on 32-bit targets.
+        try std.testing.expect(id >= 1 and id <= max_id);
+        try std.testing.expect(!seen[@intCast(id)]);
+        seen[@intCast(id)] = true;
+    }
+}
+
 test "resolveSlackStatusTarget prefers thread_id then falls back to message_id" {
     const with_thread = resolveSlackStatusTarget(.{
         .channel_id = "C123",
@@ -2399,7 +2526,16 @@ test "mergeSchedulerTickChangesAndSave preserves runtime agent fields" {
 
     var runtime = CronScheduler.init(allocator, 32, true);
     defer runtime.deinit();
-    _ = try runtime.addAgentJob("* * * * *", "summarize merge state", "openrouter/anthropic/claude-sonnet-4", .{});
+    const runtime_job = try runtime.addAgentJob("* * * * *", "summarize merge state", "openrouter/anthropic/claude-sonnet-4", .{
+        .mode = .always,
+        .channel = "telegram",
+        .account_id = "backup",
+        .to = "chat-42",
+        .peer_kind = .group,
+        .peer_id = "-100123",
+        .thread_id = "77",
+    });
+    runtime_job.session_target = .main;
     runtime.jobs.items[runtime.jobs.items.len - 1].next_run_secs = 0;
     try cron.saveJobs(&runtime);
 
@@ -2434,6 +2570,64 @@ test "mergeSchedulerTickChangesAndSave preserves runtime agent fields" {
     try std.testing.expectEqualStrings("summarize merge state", job.prompt.?);
     try std.testing.expect(job.model != null);
     try std.testing.expectEqualStrings("openrouter/anthropic/claude-sonnet-4", job.model.?);
+    try std.testing.expectEqual(cron.SessionTarget.main, job.session_target);
+    try std.testing.expect(job.delivery.account_id != null);
+    try std.testing.expectEqualStrings("backup", job.delivery.account_id.?);
+    try std.testing.expect(job.delivery.to != null);
+    try std.testing.expectEqualStrings("chat-42", job.delivery.to.?);
+    try std.testing.expectEqual(agent_routing.ChatType.group, job.delivery.peer_kind.?);
+    try std.testing.expect(job.delivery.peer_id != null);
+    try std.testing.expectEqualStrings("-100123", job.delivery.peer_id.?);
+    try std.testing.expect(job.delivery.thread_id != null);
+    try std.testing.expectEqualStrings("77", job.delivery.thread_id.?);
+}
+
+test "resolveInboundMainSessionKeyWithMetadata routes cron callbacks to canonical main session" {
+    const allocator = std.testing.allocator;
+    const bindings = [_]agent_routing.AgentBinding{
+        .{
+            .agent_id = "tg-ops",
+            .match = .{
+                .channel = "telegram",
+                .account_id = "backup",
+                .peer = .{ .kind = .group, .id = "-100123:thread:77" },
+            },
+        },
+    };
+    const config = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+        .agent_bindings = &bindings,
+        .channels = .{
+            .telegram = &[_]@import("config_types.zig").TelegramConfig{
+                .{ .account_id = "backup", .bot_token = "token" },
+            },
+        },
+    };
+    const msg = bus_mod.InboundMessage{
+        .channel = "telegram",
+        .sender_id = "system:cron",
+        .chat_id = "chat-42",
+        .content = "done",
+        .session_key = "telegram:backup:chat-42",
+        .metadata_json = "{\"account_id\":\"backup\",\"peer_kind\":\"group\",\"peer_id\":\"-100123\",\"thread_id\":\"77\"}",
+    };
+    var parsed_meta = parseInboundMetadata(allocator, msg.metadata_json);
+    defer parsed_meta.deinit();
+
+    const session_key = resolveInboundMainSessionKeyWithMetadata(allocator, &config, &msg, parsed_meta.fields) orelse return error.TestUnexpectedResult;
+    defer allocator.free(session_key);
+    try std.testing.expectEqualStrings("agent:tg-ops:main", session_key);
+
+    const other = bus_mod.InboundMessage{
+        .channel = "telegram",
+        .sender_id = "user-7",
+        .chat_id = "chat-42",
+        .content = "hello",
+        .session_key = "telegram:chat-42",
+    };
+    try std.testing.expect(resolveInboundMainSessionKeyWithMetadata(allocator, &config, &other, .{}) == null);
 }
 
 test "channelSupervisorThread respects shutdown" {

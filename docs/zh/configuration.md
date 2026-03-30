@@ -71,6 +71,33 @@ nullclaw onboard --interactive
 
 ## 核心配置块说明
 
+### `diagnostics`
+
+- 用于控制运行时诊断与可观测性输出。
+- 配置 OpenTelemetry 时，请使用嵌套的 `diagnostics.otel` 对象。
+- OTEL spans 会在回合完成、agent 结束等自然运行边界触发 flush；更长运行流程仍保留批量 flush 作为兜底。
+
+示例：
+
+```json
+{
+  "diagnostics": {
+    "backend": "otel",
+    "log_tool_calls": true,
+    "log_message_receipts": true,
+    "log_message_payloads": true,
+    "log_llm_io": true,
+    "otel": {
+      "endpoint": "http://otel:4318",
+      "service_name": "nullclaw",
+      "headers": {
+        "Authorization": "Bearer example-token"
+      }
+    }
+  }
+}
+```
+
 ### `models.providers`
 
 - 定义各 LLM provider 的连接参数与 API Key。
@@ -89,6 +116,15 @@ nullclaw onboard --interactive
   }
 }
 ```
+
+常见的 provider 级字段：
+
+- `api_key`：该 provider 条目的凭据。
+- `base_url`：用于自定义或自托管 OpenAI 兼容端点的地址覆盖。
+- `api_mode`：为兼容 provider 选择 `chat_completions` 或 `responses`。
+- `user_agent`：可选的 `User-Agent` 请求头覆盖。
+- `max_streaming_prompt_bytes`：当估算 prompt 大小超过该阈值时跳过流式请求。
+- `chat_template_enable_thinking_param`：针对自定义 OpenAI 兼容的 vLLM/Qwen 端点，把 `reasoning_effort` 映射到 `chat_template_kwargs.enable_thinking`。
 
 ### `agents.defaults.model.primary`
 
@@ -172,6 +208,7 @@ nullclaw onboard --interactive
 - 相对路径会相对于 `config.json` 所在目录解析。
 - 绝对路径会原样使用。
 - 配置中可以写 `/` 或 `\`，运行时会按当前操作系统规范化路径分隔符。
+- `workspace_path` 不会禁用 `system_prompt`。如果两者同时设置，nullclaw 仍会应用命名 agent 的 profile prompt，并从该独立工作区加载 bootstrap 上下文。
 - 首次使用时，如果工作区不存在，nullclaw 会自动创建并初始化：
   - `AGENTS.md`
   - `SOUL.md`
@@ -191,6 +228,89 @@ nullclaw onboard --interactive
 
 - 两个命名 agent 即使使用相同的 provider/model，也可以保持各自独立的持久笔记和工作区。
 - `workspace_path` 本身不会决定聊天路由；路由仍然由 `bindings`、`/bind` 或显式 `--agent` / `/subagents spawn --agent` 决定。
+
+### `reliability`
+
+- 配置 LLM 提供者的全局重试和故障转移行为。
+- `provider_retries`: 重试失败的 LLM 请求的次数（默认值：2）。
+- `provider_backoff_ms`: 重试之间的初始指数退避延迟（默认值：500 毫秒）。
+- `fallback_providers`: 当未显式指定 provider 的模型需要在主要提供方之外继续尝试时，可使用的备用提供方名称列表。
+- `model_fallbacks`: 模型到有序备用模型列表的映射。每个备用项既可以是裸模型名，也可以是显式的 `provider/model` 引用。
+
+示例：
+
+```json
+{
+  "reliability": {
+    "provider_retries": 2,
+    "provider_backoff_ms": 500,
+    "fallback_providers": ["groq", "openai"],
+    "model_fallbacks": [
+      {
+        "model": "anthropic/claude-sonnet-4",
+        "fallbacks": ["openai/gpt-4o", "groq/llama-3.3-70b"]
+      }
+    ]
+  }
+}
+```
+
+备注：
+
+- 裸模型名的故障转移顺序：先尝试主要提供方，再依次尝试每个列出的 `fallback_provider`。
+- 像 `openai/gpt-4o` 这样的显式 `provider/model` 备用项会直接路由到对应 provider，不会再走通用 provider 扇出链路。
+- `api_keys`: (可选) 用于在速率限制 (429) 错误时轮换的额外 API 密钥列表。
+
+### `identity`（AIEOS v1.1）
+
+如果你希望运行时身份来自 AIEOS 文档，可以使用这一节。配置后，nullclaw 会把解析后的 AIEOS 内容连同 `AGENTS.md`、`IDENTITY.md` 等工作区身份文件一起注入 system prompt：
+
+```json
+{
+  "identity": {
+    "format": "aieos",
+    "aieos_path": "./identity/aieos.identity.json"
+  }
+}
+```
+
+也可以直接把同样的文档内联到配置里：
+
+```json
+{
+  "identity": {
+    "format": "aieos",
+    "aieos_inline": "{\"identity\":{\"names\":{\"first\":\"nullclaw-assistant\"},\"bio\":\"通用自主助手\"},\"linguistics\":{\"style\":\"concise\"},\"motivations\":{\"core_drive\":\"安全地帮助操作者完成任务\"}}"
+  }
+}
+```
+
+最小 AIEOS v1.1 示例文件（`identity/aieos.identity.json`）：
+
+```json
+{
+  "identity": {
+    "names": {
+      "first": "nullclaw-assistant"
+    },
+    "bio": "通用自主助手"
+  },
+  "linguistics": {
+    "style": "concise"
+  },
+  "motivations": {
+    "core_drive": "安全地帮助操作者完成任务"
+  }
+}
+```
+
+说明：
+
+- AIEOS payload 采用 `identity`、`psychology`、`linguistics`、`motivations`、`capabilities` 等顶层 section。
+- 为了可维护性和版本控制可读性，优先使用 `aieos_path`。
+- 只有在你确实需要单文件自包含配置时，再使用 `aieos_inline`。
+- `identity.format` 应与 payload 来源保持一致，也就是 `aieos`。
+- 相对路径的 `aieos_path` 会优先按当前 workspace 解析，找不到时再按当前工作目录解析。
 
 ### `channels`
 
@@ -380,6 +500,68 @@ Telegram forum topics：
 - `bindings` 中的 `match.account_id` 将 binding 限定到某个特定 Telegram 账号。
 - 如果省略 `match.account_id`，该 binding 可匹配该 channel 下的任意 Telegram 账号。
 - 只有同一个 nullclaw 实例运行多个 Telegram bot 账号/token 时，不同 account id 才有意义。
+
+### Web UI / Browser Relay
+
+`channels.web` 用于浏览器 UI / 扩展通过 WebSocket 接入，默认路径是 `/ws`。
+
+示例：
+
+```json
+{
+  "channels": {
+    "web": {
+      "accounts": {
+        "default": {
+          "transport": "local",
+          "listen": "127.0.0.1",
+          "port": 32123,
+          "path": "/ws",
+          "auth_token": "replace-with-long-random-token",
+          "message_auth_mode": "pairing",
+          "allowed_origins": ["http://localhost:5173"]
+        }
+      }
+    }
+  }
+}
+```
+
+实用规则：
+
+- 想使用“先连上再配对”的本地体验，保持 `listen = "127.0.0.1"`。
+- 在 local transport 下，只有 loopback 才允许未鉴权的 WebSocket upgrade；这样 UI 才能先连上，再发送 `pairing_request`。
+- 如果把 `listen` 改成 `0.0.0.0` 或其他非 loopback 地址，那么 WebSocket upgrade 一开始就必须带上 channel token：
+  - `ws://host:32123/ws?token=<auth_token>`
+  - 或 `Authorization: Bearer <auth_token>`
+- 非 loopback bind 下，不要假设 local `pairing_request` 还能在未鉴权连接上工作；这个 pairing-first 流程本来就是只给 loopback 用的。
+- `message_auth_mode = "pairing"` 表示每条 `user_message` 都要带上 pairing 流程返回的 UI `access_token`。
+- `message_auth_mode = "token"` 只支持 local transport，并且要求使用配置或环境变量中的稳定 token。此模式下，UI 每条 `user_message` 发送 `auth_token`，而不是 pairing JWT。
+- `auth_token` 既可以加固 WebSocket upgrade，在非 loopback bind 时也会变成必需项。
+- WebSocket 端点用的是 `/ws`。`/pair` 属于 HTTP gateway API，不是 web channel 的 WebSocket 配对入口。
+- 对于 headless/LAN 场景，更稳妥的运维路径仍然是 SSH 隧道，或者在 loopback 绑定前面加反向代理。
+
+远程 / 无头设备示例：
+
+```json
+{
+  "channels": {
+    "web": {
+      "accounts": {
+        "default": {
+          "transport": "local",
+          "listen": "0.0.0.0",
+          "port": 32123,
+          "path": "/ws",
+          "auth_token": "replace-with-long-random-token",
+          "message_auth_mode": "token",
+          "allowed_origins": ["https://chat-ui.example.com"]
+        }
+      }
+    }
+  }
+}
+```
 
 Max 示例：
 

@@ -1,6 +1,6 @@
 # NullClaw English Docs
 
-This directory provides structured English documentation for NullClaw, covering installation, configuration, operations, and development.
+This directory provides structured English documentation for NullClaw, covering installation, configuration, operations, integration, and development.
 
 Community: [Join Discord](https://discord.gg/Bfmdua22Ud)
 
@@ -18,7 +18,6 @@ If you are new here, use the guided paths below instead of guessing which page t
 
 - Start with [Installation](./installation.md) if NullClaw is not running yet
 - Go to [Configuration](./configuration.md) if you already installed it
-- Go to [External Channel Plugins](./external-channels.md) if you are adding a non-core channel
 - Jump to [Commands](./commands.md) if you want a task-based CLI reference
 
 **If you came from ...**
@@ -45,9 +44,20 @@ Focus on:
 - [Usage and Operations](./usage.md)
 - [Security](./security.md)
 - [Gateway API](./gateway-api.md)
+- [DingTalk Ops Readiness](./ops/dingtalk-ops-readiness.md)
+- [Lark Ops Readiness](./ops/lark-ops-readiness.md)
 - [Signal Deployment](../../SIGNAL.md)
 
-### 3. I want to contribute code or docs
+### 3. I want to integrate beyond built-in channels
+
+Focus on:
+
+- [External Channel Plugins](./external-channels.md)
+- [Configuration](./configuration.md)
+- [Usage and Operations](./usage.md)
+- [Architecture](./architecture.md)
+
+### 4. I want to contribute code or docs
 
 Focus on:
 
@@ -61,13 +71,18 @@ Focus on:
 - [Installation](./installation.md)
 - [Termux Guide](./termux.md)
 - [Configuration](./configuration.md)
-- [External Channel Plugins](./external-channels.md)
 - [Usage and Operations](./usage.md)
 - [Architecture](./architecture.md)
 - [Security](./security.md)
 - [Gateway API](./gateway-api.md)
+- [External Channel Plugins](./external-channels.md)
 - [Commands](./commands.md)
 - [Development](./development.md)
+
+## Ops Runbooks
+
+- [DingTalk Ops Readiness](./ops/dingtalk-ops-readiness.md)
+- [Lark Ops Readiness](./ops/lark-ops-readiness.md)
 
 ## Start Here
 
@@ -83,7 +98,7 @@ nullclaw onboard --interactive
 nullclaw agent -m "hello nullclaw"
 ```
 
-If you are building from source instead of Homebrew, start with [Installation](./installation.md).
+If you are not installing via Homebrew, start with [Installation](./installation.md) for container and source paths.
 
 ## Specialized Guides
 
@@ -93,16 +108,14 @@ If you are building from source instead of Homebrew, start with [Installation](.
 
 ## Next Steps
 
-- Follow [Installation](./installation.md) for setup from Homebrew or source
-- Continue to [Configuration](./configuration.md) to wire providers, memory, and channels
-- Use [External Channel Plugins](./external-channels.md) when a channel should live out of tree
+- Follow [Installation](./installation.md) for setup from Homebrew, container, or source
+- Continue to [Configuration](./configuration.md) to wire providers, memory, channels, and gateway settings
 - Use [Usage and Operations](./usage.md) once you want to run NullClaw day to day
 
 ## Related Pages
 
 - [Termux Guide](./termux.md)
 - [Commands](./commands.md)
-- [External Channel Plugins](./external-channels.md)
 - [Development](./development.md)
 - [Architecture](./architecture.md)
 - [Gateway API](./gateway-api.md)

@@ -459,6 +459,46 @@ fn runService(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
 
 // ── Cron ─────────────────────────────────────────────────────────
 
+const CronAddAgentOptions = struct {
+    model: ?[]const u8 = null,
+    session_target: yc.cron.SessionTarget = .isolated,
+    delivery: yc.cron.DeliveryConfig = .{},
+};
+
+fn parseCronSessionTargetArg(raw: []const u8) !yc.cron.SessionTarget {
+    return yc.cron.SessionTarget.parseStrict(raw);
+}
+
+fn parseCronAgentOptions(sub_args: []const []const u8, start_index: usize) !CronAddAgentOptions {
+    var options = CronAddAgentOptions{};
+    var i: usize = start_index;
+    while (i < sub_args.len) : (i += 1) {
+        if (i + 1 < sub_args.len and std.mem.eql(u8, sub_args[i], "--model")) {
+            options.model = sub_args[i + 1];
+            i += 1;
+        } else if (i + 1 < sub_args.len and std.mem.eql(u8, sub_args[i], "--session-target")) {
+            options.session_target = try parseCronSessionTargetArg(sub_args[i + 1]);
+            i += 1;
+        } else if (std.mem.eql(u8, sub_args[i], "--announce")) {
+            options.delivery.mode = .always;
+        } else if (i + 1 < sub_args.len and std.mem.eql(u8, sub_args[i], "--channel")) {
+            options.delivery.channel = sub_args[i + 1];
+            i += 1;
+        } else if (i + 1 < sub_args.len and std.mem.eql(u8, sub_args[i], "--account")) {
+            options.delivery.account_id = sub_args[i + 1];
+            i += 1;
+        } else if (i + 1 < sub_args.len and std.mem.eql(u8, sub_args[i], "--to")) {
+            options.delivery.to = sub_args[i + 1];
+            i += 1;
+        }
+    }
+    return options;
+}
+
+fn parseCronAddAgentOptions(sub_args: []const []const u8) !CronAddAgentOptions {
+    return parseCronAgentOptions(sub_args, 3);
+}
+
 fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
     if (sub_args.len < 1) {
         std.debug.print(std.fmt.comptimePrint(
@@ -468,7 +508,7 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             \\  list                          List all scheduled tasks
             \\  status                        Show scheduler daemon status
             \\  add <expression> <command>    Add a recurring cron job
-            \\  add-agent <expression> <prompt> [--model <model>] [--announce] [--channel <name>] [--to <id>]
+            \\  add-agent <expression> <prompt> [--model <model>] [--announce] [--channel <name>] [--account <id>] [--to <id>]
             \\                                Add a recurring agent cron job
             \\  once <delay> <command>        Add a one-shot delayed task
             \\  once-agent <delay> <prompt> [--model <model>]
@@ -498,37 +538,17 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         try yc.cron.cliAddJob(allocator, sub_args[1], sub_args[2]);
     } else if (std.mem.eql(u8, subcmd, "add-agent")) {
         if (sub_args.len < 3) {
-            std.debug.print("Usage: nullclaw cron add-agent <expression> <prompt> [--model <model>] [--announce] [--channel <name>] [--to <id>]\n", .{});
+            std.debug.print("Usage: nullclaw cron add-agent <expression> <prompt> [--model <model>] [--session-target <isolated|main>] [--announce] [--channel <name>] [--account <id>] [--to <id>]\n", .{});
             std.process.exit(1);
         }
-        var model: ?[]const u8 = null;
-        var delivery_mode: yc.cron.DeliveryMode = .none;
-        var channel: ?[]const u8 = null;
-        var to: ?[]const u8 = null;
-
-        var i: usize = 3;
-        while (i < sub_args.len) : (i += 1) {
-            if (i + 1 < sub_args.len and std.mem.eql(u8, sub_args[i], "--model")) {
-                model = sub_args[i + 1];
-                i += 1;
-            } else if (std.mem.eql(u8, sub_args[i], "--announce")) {
-                delivery_mode = .always;
-            } else if (i + 1 < sub_args.len and std.mem.eql(u8, sub_args[i], "--channel")) {
-                channel = sub_args[i + 1];
-                i += 1;
-            } else if (i + 1 < sub_args.len and std.mem.eql(u8, sub_args[i], "--to")) {
-                to = sub_args[i + 1];
-                i += 1;
-            }
-        }
-        const delivery = yc.cron.DeliveryConfig{
-            .mode = delivery_mode,
-            .channel = channel,
-            .to = to,
-            .channel_owned = false,
-            .to_owned = false,
+        const options = parseCronAddAgentOptions(sub_args) catch |err| switch (err) {
+            error.InvalidSessionTarget => {
+                std.debug.print("Invalid --session-target: expected 'isolated' or 'main'\n", .{});
+                std.process.exit(1);
+            },
+            else => return err,
         };
-        try yc.cron.cliAddAgentJob(allocator, sub_args[1], sub_args[2], model, delivery);
+        try yc.cron.cliAddAgentJob(allocator, sub_args[1], sub_args[2], options.model, options.session_target, options.delivery);
     } else if (std.mem.eql(u8, subcmd, "once")) {
         if (sub_args.len < 3) {
             std.debug.print("Usage: nullclaw cron once <delay> <command>\n", .{});
@@ -537,18 +557,17 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         try yc.cron.cliAddOnce(allocator, sub_args[1], sub_args[2]);
     } else if (std.mem.eql(u8, subcmd, "once-agent")) {
         if (sub_args.len < 3) {
-            std.debug.print("Usage: nullclaw cron once-agent <delay> <prompt> [--model <model>]\n", .{});
+            std.debug.print("Usage: nullclaw cron once-agent <delay> <prompt> [--model <model>] [--session-target <isolated|main>]\n", .{});
             std.process.exit(1);
         }
-        var model: ?[]const u8 = null;
-        var i: usize = 3;
-        while (i < sub_args.len) : (i += 1) {
-            if (i + 1 < sub_args.len and std.mem.eql(u8, sub_args[i], "--model")) {
-                model = sub_args[i + 1];
-                i += 1;
-            }
-        }
-        try yc.cron.cliAddAgentOnce(allocator, sub_args[1], sub_args[2], model);
+        const options = parseCronAgentOptions(sub_args, 3) catch |err| switch (err) {
+            error.InvalidSessionTarget => {
+                std.debug.print("Invalid --session-target: expected 'isolated' or 'main'\n", .{});
+                std.process.exit(1);
+            },
+            else => return err,
+        };
+        try yc.cron.cliAddAgentOnce(allocator, sub_args[1], sub_args[2], options.model, options.session_target);
     } else if (std.mem.eql(u8, subcmd, "remove")) {
         if (sub_args.len < 2) {
             std.debug.print("Usage: nullclaw cron remove <id>\n", .{});
@@ -575,7 +594,7 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         try yc.cron.cliRunJob(allocator, sub_args[1]);
     } else if (std.mem.eql(u8, subcmd, "update")) {
         if (sub_args.len < 2) {
-            std.debug.print("Usage: nullclaw cron update <id> [--expression <expr>] [--command <cmd>] [--prompt <prompt>] [--model <model>] [--enable] [--disable]\n", .{});
+            std.debug.print("Usage: nullclaw cron update <id> [--expression <expr>] [--command <cmd>] [--prompt <prompt>] [--model <model>] [--session-target <isolated|main>] [--enable] [--disable]\n", .{});
             std.process.exit(1);
         }
         const id = sub_args[1];
@@ -584,6 +603,7 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         var prompt: ?[]const u8 = null;
         var model: ?[]const u8 = null;
         var enabled: ?bool = null;
+        var session_target: ?yc.cron.SessionTarget = null;
         var i: usize = 2;
         while (i < sub_args.len) : (i += 1) {
             if (std.mem.eql(u8, sub_args[i], "--expression") and i + 1 < sub_args.len) {
@@ -598,13 +618,28 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             } else if (std.mem.eql(u8, sub_args[i], "--model") and i + 1 < sub_args.len) {
                 i += 1;
                 model = sub_args[i];
+            } else if (std.mem.eql(u8, sub_args[i], "--session-target") and i + 1 < sub_args.len) {
+                i += 1;
+                session_target = parseCronSessionTargetArg(sub_args[i]) catch |err| switch (err) {
+                    error.InvalidSessionTarget => {
+                        std.debug.print("Invalid --session-target: expected 'isolated' or 'main'\n", .{});
+                        std.process.exit(1);
+                    },
+                    else => return err,
+                };
             } else if (std.mem.eql(u8, sub_args[i], "--enable")) {
                 enabled = true;
             } else if (std.mem.eql(u8, sub_args[i], "--disable")) {
                 enabled = false;
             }
         }
-        try yc.cron.cliUpdateJob(allocator, id, expression, command, prompt, model, enabled);
+        yc.cron.cliUpdateJob(allocator, id, expression, command, prompt, model, enabled, session_target) catch |err| switch (err) {
+            error.SessionTargetRequiresAgentJob => {
+                std.debug.print("session_target can only be updated for agent jobs\n", .{});
+                std.process.exit(1);
+            },
+            else => return err,
+        };
     } else if (std.mem.eql(u8, subcmd, "runs")) {
         if (sub_args.len < 2) {
             std.debug.print("Usage: nullclaw cron runs <id>\n", .{});
@@ -1949,14 +1984,14 @@ fn runWorkspace(allocator: std.mem.Allocator, sub_args: []const []const u8) !voi
 fn runWorkspaceEdit(allocator: std.mem.Allocator, args: []const []const u8, cfg: yc.config.Config) void {
     if (args.len < 1) {
         std.debug.print("Usage: nullclaw workspace edit <filename>\n\n", .{});
-        std.debug.print("Bootstrap files: SOUL.md, AGENTS.md, TOOLS.md, IDENTITY.md, USER.md, HEARTBEAT.md, BOOTSTRAP.md, MEMORY.md\n", .{});
+        std.debug.print("Bootstrap files: SOUL.md, AGENTS.md, TOOLS.md, CONFIG.md, IDENTITY.md, USER.md, HEARTBEAT.md, BOOTSTRAP.md, MEMORY.md\n", .{});
         std.process.exit(1);
     }
     const filename = args[0];
 
     if (!yc.bootstrap.isBootstrapFilename(filename)) {
         std.debug.print("Not a bootstrap file: {s}\n", .{filename});
-        std.debug.print("Bootstrap files: SOUL.md, AGENTS.md, TOOLS.md, IDENTITY.md, USER.md, HEARTBEAT.md, BOOTSTRAP.md, MEMORY.md\n", .{});
+        std.debug.print("Bootstrap files: SOUL.md, AGENTS.md, TOOLS.md, CONFIG.md, IDENTITY.md, USER.md, HEARTBEAT.md, BOOTSTRAP.md, MEMORY.md\n", .{});
         std.process.exit(1);
     }
 
@@ -2460,6 +2495,17 @@ fn printNoMessagingChannelConfiguredHint() void {
     std.debug.print("  Signal:   {{\"channels\": {{\"signal\": {{\"accounts\": {{\"main\": {{\"http_url\": \"http://127.0.0.1:8080\", \"account\": \"+1234567890\"}}}}}}}}\n", .{});
 }
 
+const ChannelStartBusDrainCtx = struct {
+    allocator: std.mem.Allocator,
+    bus: *yc.bus.Bus,
+};
+
+fn drainChannelStartBus(ctx: *const ChannelStartBusDrainCtx) void {
+    while (ctx.bus.consumeInbound()) |msg| {
+        msg.deinit(ctx.allocator);
+    }
+}
+
 fn runChannelStart(allocator: std.mem.Allocator, args: []const []const u8) !void {
     if (args.len > 0 and std.mem.eql(u8, args[0], "--all")) {
         std.debug.print("Use `nullclaw gateway` to start all configured channels/accounts.\n", .{});
@@ -2567,8 +2613,21 @@ fn runGatewayChannel(allocator: std.mem.Allocator, config: *const yc.config.Conf
     var registry = yc.channels.dispatch.ChannelRegistry.init(allocator);
     defer registry.deinit();
 
+    // Use a drain-only bus so `channel start` can exercise inbound wiring
+    // without leaking or stalling if the user sends test messages.
+    var event_bus = yc.bus.Bus.init();
+    var drain_ctx = ChannelStartBusDrainCtx{
+        .allocator = allocator,
+        .bus = &event_bus,
+    };
+    const drain_thread = try std.Thread.spawn(.{}, drainChannelStartBus, .{&drain_ctx});
+    defer drain_thread.join();
+    defer event_bus.close();
+
     const mgr = try yc.channel_manager.ChannelManager.init(allocator, config, &registry);
     defer mgr.deinit();
+
+    mgr.setEventBus(&event_bus);
 
     try mgr.collectConfiguredChannels();
 
@@ -4147,4 +4206,35 @@ test "hasConfiguredButBuildDisabledStartableChannels detects configured disabled
     };
 
     try std.testing.expectEqual(!yc.channel_catalog.isBuildEnabled(.telegram), hasConfiguredButBuildDisabledStartableChannels(&cfg));
+}
+
+test "parseCronAddAgentOptions preserves delivery account flag" {
+    // Regression: cron add-agent ignored --account and dropped delivery account routing.
+    const args = [_][]const u8{
+        "add-agent",
+        "0 7 * * 1,2,4",
+        "Check traffic",
+        "--model",
+        "glm-cn/glm-5-turbo",
+        "--session-target",
+        "main",
+        "--announce",
+        "--channel",
+        "telegram",
+        "--account",
+        "main",
+        "--to",
+        "7972814626",
+    };
+
+    const options = try parseCronAddAgentOptions(&args);
+    try std.testing.expectEqualStrings("glm-cn/glm-5-turbo", options.model.?);
+    try std.testing.expectEqual(yc.cron.SessionTarget.main, options.session_target);
+    try std.testing.expectEqual(yc.cron.DeliveryMode.always, options.delivery.mode);
+    try std.testing.expectEqualStrings("telegram", options.delivery.channel.?);
+    try std.testing.expectEqualStrings("main", options.delivery.account_id.?);
+    try std.testing.expectEqualStrings("7972814626", options.delivery.to.?);
+    try std.testing.expect(!options.delivery.channel_owned);
+    try std.testing.expect(!options.delivery.account_id_owned);
+    try std.testing.expect(!options.delivery.to_owned);
 }

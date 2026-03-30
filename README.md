@@ -1,4 +1,6 @@
-**Official website:** [nullclaw.io](https://nullclaw.io)
+Want a simpler way to install and configure nullclaw with a UI? Try [nullhub](https://github.com/nullclaw/nullhub)! (currently in beta)
+
+[nullhub](https://github.com/nullclaw/nullhub) provides a UI layer for the Null ecosystem: simpler nullclaw setup and configuration, orchestration from [nullboiler](https://github.com/nullclaw/nullboiler), observability from [nullwatch](https://github.com/nullclaw/nullwatch), and task tracking from [nulltickets](https://github.com/nullclaw/nulltickets).
 
 <p align="center">
   <img src="nullclaw.png" alt="nullclaw" width="200" />
@@ -525,6 +527,7 @@ Named agent profiles are configured separately from bindings. Bindings only choo
 
 If a named agent should run from its own workspace, set `agents.list[].workspace_path`.
 Relative paths are resolved from the directory that contains `config.json`, the workspace is scaffolded on first use, and the agent gets a durable memory namespace `agent:<agent-id>`.
+Setting `workspace_path` does not disable `system_prompt`: when both are configured, the named profile prompt is still applied and the workspace bootstrap files are loaded from that dedicated workspace.
 This applies to `nullclaw agent --agent <id>`, `/subagents spawn --agent <id>`, and routed sessions resolved through `bindings`.
 
 Minimal end-to-end example:
@@ -655,8 +658,10 @@ Use `channels.web` for browser UI events (WebChannel v1):
 - `message_auth_mode` controls inbound `user_message` auth:
   - `"pairing"` (default): send `pairing_request`, receive `pairing_result`, include UI `access_token` in every `user_message`.
   - `"token"` (local transport only): include `auth_token` in each `user_message` payload (`access_token` is also accepted for compatibility).
-- `auth_token` is optional hardening for WebSocket upgrade and required when binding non-loopback addresses.
-- Remote host: set `"listen": "0.0.0.0"` and terminate TLS at proxy/CDN (`wss://...`).
+- `auth_token` hardens the WebSocket upgrade and becomes required when binding non-loopback addresses.
+- Unauthenticated WebSocket upgrade is loopback-only. Pairing-first local UX works on `127.0.0.1`, but a public/LAN bind must authenticate the `/ws` upgrade on the first hop with `?token=<auth_token>` or `Authorization: Bearer <auth_token>`.
+- `/ws` is the WebSocket endpoint. `/pair` belongs to the HTTP gateway API and is not part of the web channel handshake.
+- Remote/headless host: if you bind `"listen": "0.0.0.0"`, prefer a stable configured token plus `message_auth_mode: "token"` behind TLS/reverse proxy, or keep loopback bind and expose it through SSH tunnel/proxy.
 - UI/extension should live in a separate repository and connect via this WebSocket endpoint.
 - For orchestration, use local token mode with a stable token from config or env (`NULLCLAW_WEB_TOKEN`, `NULLCLAW_GATEWAY_TOKEN`, `OPENCLAW_GATEWAY_TOKEN`).
 - Relay transport (outbound agent socket) is configured via:
@@ -695,10 +700,55 @@ Use `channels.web` for browser UI events (WebChannel v1):
 | `/health` | GET | None | Health check (always public) |
 | `/pair` | POST | `X-Pairing-Code` header | Exchange one-time code for bearer token |
 | `/webhook` | POST | `Authorization: Bearer <token>` | Send message: `{"message": "your prompt"}` |
-| `/.well-known/agent.json` | GET | None | A2A Agent Card discovery (public) |
-| `/a2a` | POST | `Authorization: Bearer <token>` | A2A JSON-RPC endpoint (`message/send`, `message/stream`, `tasks/get`, `tasks/cancel`, `tasks/list`) |
+| `/.well-known/agent-card.json` | GET | None | A2A Agent Card discovery (public) |
+| `/a2a` | POST | `Authorization: Bearer <token>` | A2A JSON-RPC endpoint (canonical methods plus legacy slash aliases) |
 | `/whatsapp` | GET | Query params | Meta webhook verification |
 | `/whatsapp` | POST | None (Meta signature) | WhatsApp incoming message webhook |
+
+### A2A (Agent-to-Agent Protocol v0.3.0)
+
+NullClaw implements Google's [A2A protocol](https://github.com/google/A2A) v0.3.0, allowing any A2A-compatible agent or client to discover, authenticate, and interact with your instance over JSON-RPC 2.0.
+
+Enable in `~/.nullclaw/config.json`:
+
+```json
+{
+  "a2a": {
+    "enabled": true,
+    "name": "nullclaw",
+    "description": "General-purpose AI assistant",
+    "url": "https://example.com",
+    "version": "1.0.0"
+  }
+}
+```
+
+**Endpoints:**
+
+| Endpoint | Auth | Description |
+|----------|------|-------------|
+| `GET /.well-known/agent-card.json` | None | Agent Card discovery (public) |
+| `POST /a2a` | Bearer token | JSON-RPC 2.0 dispatch |
+
+**Supported methods:** `message/send`, `message/stream`, `tasks/get`, `tasks/cancel`, `tasks/list`, `tasks/resubscribe`.
+
+**Quick test:**
+
+```bash
+# 1. Get a bearer token
+TOKEN=$(curl -s -X POST -H "X-Pairing-Code: 123456" http://localhost:3000/pair | jq -r .token)
+
+# 2. Discover the agent
+curl http://localhost:3000/.well-known/agent-card.json
+
+# 3. Send a message
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"message":{"messageId":"msg-1","role":"user","parts":[{"kind":"text","text":"Hello"}]}}}' \
+  http://localhost:3000/a2a
+```
+
+See [Gateway API docs](docs/en/gateway-api.md) for full A2A reference including streaming, task lifecycle, and configuration details.
 
 ## Commands
 
