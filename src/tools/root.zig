@@ -5,6 +5,7 @@
 //! scheduling, delegation, browser, and image tools.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const memory_mod = @import("../memory/root.zig");
 const Memory = memory_mod.Memory;
 const bootstrap_mod = @import("../bootstrap/root.zig");
@@ -351,7 +352,7 @@ pub fn allTools(
         .path_env_vars = tc.path_env_vars,
         // sandbox and sandbox_storage initialized below if enabled
     };
-    if (opts.sandbox_enabled) {
+    if (opts.sandbox_enabled and comptime builtin.os.tag != .windows) {
         const backend = mapSandboxBackend(opts.sandbox_backend);
         st.sandbox = createSandbox(allocator, backend, workspace_dir, &st.sandbox_storage);
     }
@@ -876,6 +877,25 @@ test "all tools leaves shell sandbox disabled by default" {
     }
 
     try std.testing.expect(saw_shell);
+}
+
+test "all tools skips shell sandbox wiring on windows" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+
+    const tools = try allTools(std.testing.allocator, "C:\\tmp\\yc_test", .{
+        .sandbox_enabled = true,
+        .sandbox_backend = .docker,
+    });
+    defer deinitTools(std.testing.allocator, tools);
+
+    for (tools) |t| {
+        if (!std.mem.eql(u8, t.name(), "shell")) continue;
+        const st: *shell.ShellTool = @ptrCast(@alignCast(t.ptr));
+        try std.testing.expect(st.sandbox == null);
+        return;
+    }
+
+    return error.TestUnexpectedResult;
 }
 
 test "mapSandboxBackend preserves configured backend values" {

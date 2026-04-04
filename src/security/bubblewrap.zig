@@ -27,12 +27,22 @@ pub const BubblewrapSandbox = struct {
 
     fn wrapCommand(ptr: *anyopaque, argv: []const []const u8, buf: [][]const u8) anyerror![]const []const u8 {
         const self = resolve(ptr);
-        // bwrap --ro-bind /usr /usr --dev /dev --proc /proc --bind /tmp /tmp --bind WORKSPACE /workspace --unshare-all --die-with-parent <argv...>
+        // Keep the host shell/runtime paths visible so `/bin/sh -c ...` still
+        // works after ShellTool wraps commands with bubblewrap.
         const prefix = [_][]const u8{
             "bwrap",
             "--ro-bind",
             "/usr",
             "/usr",
+            "--ro-bind-try",
+            "/bin",
+            "/bin",
+            "--ro-bind-try",
+            "/lib",
+            "/lib",
+            "--ro-bind-try",
+            "/lib64",
+            "/lib64",
             "--dev",
             "/dev",
             "--proc",
@@ -42,7 +52,7 @@ pub const BubblewrapSandbox = struct {
             "/tmp",
             "--bind",
             self.workspace_dir,
-            "/workspace",
+            self.workspace_dir,
             "--unshare-all",
             "--die-with-parent",
         };
@@ -114,6 +124,9 @@ test "bubblewrap sandbox wrap command prepends bwrap args" {
     try std.testing.expectEqualStrings("--ro-bind", result[1]);
     try std.testing.expectEqualStrings("/usr", result[2]);
     try std.testing.expectEqualStrings("/usr", result[3]);
+    try std.testing.expectEqualStrings("--ro-bind-try", result[4]);
+    try std.testing.expectEqualStrings("/bin", result[5]);
+    try std.testing.expectEqualStrings("/bin", result[6]);
     // Original command is at the end
     try std.testing.expectEqualStrings("echo", result[result.len - 2]);
     try std.testing.expectEqualStrings("test", result[result.len - 1]);
@@ -147,7 +160,7 @@ test "bubblewrap sandbox wrap empty argv" {
 
     // Just the prefix args, no original command
     try std.testing.expectEqualStrings("bwrap", result[0]);
-    try std.testing.expect(result.len == 16);
+    try std.testing.expect(result.len == 25);
 }
 
 test "bubblewrap buffer too small returns error" {
@@ -158,6 +171,22 @@ test "bubblewrap buffer too small returns error" {
     var buf: [3][]const u8 = undefined;
     const result = sb.wrapCommand(&argv, &buf);
     try std.testing.expectError(error.BufferTooSmall, result);
+}
+
+test "bubblewrap sandbox preserves workspace path for process cwd" {
+    var bw = createBubblewrapSandbox("/tmp/workspace");
+    const sb = bw.sandbox();
+
+    const argv = [_][]const u8{ "/bin/sh", "-c", "printf test" };
+    var buf: [32][]const u8 = undefined;
+    const result = try sb.wrapCommand(&argv, &buf);
+
+    // Regression: ShellTool sets cwd before spawning bwrap, so the workspace
+    // must remain mounted at its original absolute path inside the sandbox.
+    try std.testing.expectEqualStrings("--bind", result[20]);
+    try std.testing.expectEqualStrings("/tmp/workspace", result[21]);
+    try std.testing.expectEqualStrings("/tmp/workspace", result[22]);
+    try std.testing.expectEqualStrings("/bin/sh", result[result.len - 3]);
 }
 
 test "bubblewrap sandbox availability requires executable in PATH" {
