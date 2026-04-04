@@ -11,6 +11,9 @@ const json_miniparse = @import("../json_miniparse.zig");
 const command_summary = @import("../command_summary.zig");
 const UNAVAILABLE_WORKSPACE_SENTINEL = "/__nullclaw_workspace_unavailable__";
 const log = std.log.scoped(.shell);
+const Sandbox = @import("../security/sandbox.zig").Sandbox;
+const SandboxStorage = @import("../security/sandbox.zig").SandboxStorage;
+const createSandbox = @import("../security/detect.zig").createSandbox;
 
 /// Default maximum shell command execution time (nanoseconds).
 const DEFAULT_SHELL_TIMEOUT_NS: u64 = 60 * std.time.ns_per_s;
@@ -119,7 +122,10 @@ pub const ShellTool = struct {
     /// Env var names whose platform path-list values are validated
     /// against workspace + allowed_paths before passing to child processes.
     path_env_vars: []const []const u8 = &.{},
-
+    sandbox: ?Sandbox = null,
+    // Storage for sandbox backends; must outlive the ShellTool.
+    // This is part of the vtable ownership pattern: the tool creator owns the storage.
+    sandbox_storage: SandboxStorage = .{},
     pub const tool_name = "shell";
     pub const tool_description = "Execute a shell command in the workspace directory";
     pub const tool_params =
@@ -218,39 +224,44 @@ pub const ShellTool = struct {
         // explicitly invokes PowerShell so pipes stay inside PowerShell instead
         // of being interpreted by cmd.exe first.
         const proc = @import("process_util.zig");
-        const result = if (builtin.os.tag == .windows) blk: {
-            const parsed_argv = try parseWindowsCommandArgv(allocator, command);
-            defer freeOwnedArgv(allocator, parsed_argv);
-
-            if (parsed_argv.len > 0 and isPowerShellExecutable(parsed_argv[0])) {
-                break :blk try proc.run(allocator, parsed_argv, .{
-                    .cwd = effective_cwd,
-                    .env_map = &env,
-                    .max_output_bytes = self.max_output_bytes,
-                    .timeout_ns = self.timeout_ns,
-                });
+        // Determine base argv and ownership
+        var base_argv: []const []const u8 = undefined;
+        var maybe_owned_argv: ?[]const []const u8 = null;
+        defer {
+            if (maybe_owned_argv) |owned| {
+                freeOwnedArgv(allocator, owned);
             }
+        }
 
+        if (builtin.os.tag == .windows) {
+            const parsed = try parseWindowsCommandArgv(allocator, command);
+            maybe_owned_argv = parsed;
+            if (parsed.len > 0 and isPowerShellExecutable(parsed[0])) {
+                base_argv = parsed;
+            } else {
+                const shell_cmd = platform.getShell();
+                const shell_flag = platform.getShellFlag();
+                base_argv = &.{ shell_cmd, shell_flag, command };
+            }
+        } else {
             const shell_cmd = platform.getShell();
             const shell_flag = platform.getShellFlag();
-            const full_argv = &.{ shell_cmd, shell_flag, command };
-            break :blk try proc.run(allocator, full_argv, .{
-                .cwd = effective_cwd,
-                .env_map = &env,
-                .max_output_bytes = self.max_output_bytes,
-                .timeout_ns = self.timeout_ns,
-            });
-        } else blk: {
-            const shell_cmd = platform.getShell();
-            const shell_flag = platform.getShellFlag();
-            const full_argv = &.{ shell_cmd, shell_flag, command };
-            break :blk try proc.run(allocator, full_argv, .{
-                .cwd = effective_cwd,
-                .env_map = &env,
-                .max_output_bytes = self.max_output_bytes,
-                .timeout_ns = self.timeout_ns,
-            });
-        };
+            base_argv = &.{ shell_cmd, shell_flag, command };
+        }
+
+        // Apply sandbox wrapper if configured
+        const final_argv = if (self.sandbox) |sb| blk: {
+            var wrap_buf: [512][]const u8 = undefined;
+            break :blk try sb.wrapCommand(base_argv, &wrap_buf);
+        } else base_argv;
+
+        // Execute command
+        const result = try proc.run(allocator, final_argv, .{
+            .cwd = effective_cwd,
+            .env_map = &env,
+            .max_output_bytes = self.max_output_bytes,
+            .timeout_ns = self.timeout_ns,
+        });
         defer allocator.free(result.stderr);
 
         if (result.success) {
@@ -916,4 +927,28 @@ test "shell path_env_vars passes validated vars to child" {
     defer if (result.error_msg) |e| std.testing.allocator.free(e);
     try std.testing.expect(result.success);
     try std.testing.expectEqualStrings(libs_path, result.output);
+}
+
+test "shell with sandbox enabled wraps command" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var storage: SandboxStorage = .{};
+    const sandbox = createSandbox(std.testing.allocator, .none, "/tmp", &storage);
+
+    var st = ShellTool{
+        .workspace_dir = "/tmp",
+        .sandbox = sandbox,
+        .sandbox_storage = storage,
+    };
+    const t = st.tool();
+
+    const parsed = try root.parseTestArgs("{\"command\": \"echo test\"}");
+    defer parsed.deinit();
+
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+    defer if (result.error_msg) |e| std.testing.allocator.free(e);
+
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "test") != null);
 }

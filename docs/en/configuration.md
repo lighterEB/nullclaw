@@ -814,6 +814,8 @@ Common issues:
 - `auto_save`: persists conversation memory automatically.
 - For hybrid retrieval and embedding settings, see root `config.example.json`.
 
+**Note**: The `markdown_only` memory profile automatically enables hybrid retrieval with temporal decay (half-life 30 days) for optimal relevance scoring. This ensures temporal awareness even with plain markdown files.
+
 ### `gateway`
 
 Recommended defaults:

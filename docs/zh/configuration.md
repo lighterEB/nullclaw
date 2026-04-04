@@ -627,6 +627,8 @@ Max 说明：
 - `auto_save`: 开启后会自动持久化会话记忆。
 - 可扩展 hybrid 检索与 embedding 配置（见根目录 `config.example.json`）。
 
+**注意**：`markdown_only` 内存配置文件会自动启用混合检索和时间衰减（半衰期 30 天），以实现最佳的相关性评分。这确保了对纯 markdown 文件的时间感知能力。
+
 ### `gateway`
 
 - 默认推荐：
