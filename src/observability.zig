@@ -85,6 +85,7 @@ pub const Observer = struct {
 
 const MAX_TOOL_CALL_DETAIL_LEN: usize = 1024;
 const MAX_LLM_DETAIL_LEN: usize = 2048;
+const MAX_EVENT_DETAIL_LEN: usize = 1024;
 
 fn truncateForObserver(detail: ?[]const u8, max_len: usize) ?[]const u8 {
     const raw = detail orelse return null;
@@ -99,6 +100,10 @@ fn toolDetailForObserver(detail: ?[]const u8) ?[]const u8 {
 
 fn llmDetailForObserver(detail: ?[]const u8) ?[]const u8 {
     return truncateForObserver(detail, MAX_LLM_DETAIL_LEN);
+}
+
+fn eventDetailForObserver(detail: ?[]const u8) ?[]const u8 {
+    return truncateForObserver(detail, MAX_EVENT_DETAIL_LEN);
 }
 
 // ── NoopObserver ─────────────────────────────────────────────────────
@@ -157,7 +162,13 @@ pub const LogObserver = struct {
         switch (event.*) {
             .agent_start => |e| {
                 if (e.channel) |ch| {
-                    std.log.info("agent.start provider={s} model={s} channel={s}", .{ e.provider, e.model, ch });
+                    if (e.bot_account) |bot| {
+                        std.log.info("agent.start provider={s} model={s} channel={s} bot_account={s}", .{ e.provider, e.model, ch, bot });
+                    } else {
+                        std.log.info("agent.start provider={s} model={s} channel={s}", .{ e.provider, e.model, ch });
+                    }
+                } else if (e.bot_account) |bot| {
+                    std.log.info("agent.start provider={s} model={s} bot_account={s}", .{ e.provider, e.model, bot });
                 } else {
                     std.log.info("agent.start provider={s} model={s}", .{ e.provider, e.model });
                 }
@@ -178,10 +189,34 @@ pub const LogObserver = struct {
             .channel_message => |e| std.log.info("channel.message channel={s} direction={s}", .{ e.channel, e.direction }),
             .heartbeat_tick => std.log.info("heartbeat.tick", .{}),
             .err => |e| std.log.info("error component={s} message={s}", .{ e.component, e.message }),
-            .subagent_start => |e| std.log.info("subagent.start agent_name={s}", .{e.agent_name}),
+            .subagent_start => |e| {
+                if (eventDetailForObserver(e.task)) |task| {
+                    std.log.info("subagent.start agent_name={s} task={s}", .{ e.agent_name, task });
+                } else {
+                    std.log.info("subagent.start agent_name={s}", .{e.agent_name});
+                }
+            },
             .cron_job_start => |e| {
                 if (e.channel) |ch| {
-                    std.log.info("cron.job.start channel={s}", .{ch});
+                    if (e.bot_account) |bot| {
+                        if (eventDetailForObserver(e.task)) |task| {
+                            std.log.info("cron.job.start channel={s} bot_account={s} task={s}", .{ ch, bot, task });
+                        } else {
+                            std.log.info("cron.job.start channel={s} bot_account={s}", .{ ch, bot });
+                        }
+                    } else if (eventDetailForObserver(e.task)) |task| {
+                        std.log.info("cron.job.start channel={s} task={s}", .{ ch, task });
+                    } else {
+                        std.log.info("cron.job.start channel={s}", .{ch});
+                    }
+                } else if (e.bot_account) |bot| {
+                    if (eventDetailForObserver(e.task)) |task| {
+                        std.log.info("cron.job.start bot_account={s} task={s}", .{ bot, task });
+                    } else {
+                        std.log.info("cron.job.start bot_account={s}", .{bot});
+                    }
+                } else if (eventDetailForObserver(e.task)) |task| {
+                    std.log.info("cron.job.start task={s}", .{task});
                 } else {
                     std.log.info("cron.job.start", .{});
                 }
@@ -435,10 +470,34 @@ pub const FileObserver = struct {
             .channel_message => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"channel_message\",\"channel\":{f},\"direction\":{f}}}", .{ std.json.fmt(e.channel, .{}), std.json.fmt(e.direction, .{}) }) catch return,
             .heartbeat_tick => std.fmt.bufPrint(&buf, "{{\"event\":\"heartbeat_tick\"}}", .{}) catch return,
             .err => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"error\",\"component\":{f},\"message\":{f}}}", .{ std.json.fmt(e.component, .{}), std.json.fmt(e.message, .{}) }) catch return,
-            .subagent_start => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"subagent_start\",\"agent_name\":{f}}}", .{std.json.fmt(e.agent_name, .{})}) catch return,
+            .subagent_start => |e| blk: {
+                if (eventDetailForObserver(e.task)) |task| {
+                    break :blk std.fmt.bufPrint(&buf, "{{\"event\":\"subagent_start\",\"agent_name\":{f},\"task\":{f}}}", .{ std.json.fmt(e.agent_name, .{}), std.json.fmt(task, .{}) }) catch return;
+                }
+                break :blk std.fmt.bufPrint(&buf, "{{\"event\":\"subagent_start\",\"agent_name\":{f}}}", .{std.json.fmt(e.agent_name, .{})}) catch return;
+            },
             .cron_job_start => |e| blk: {
+                const task = eventDetailForObserver(e.task);
                 if (e.channel) |ch| {
+                    if (e.bot_account) |bot| {
+                        if (task) |task_detail| {
+                            break :blk std.fmt.bufPrint(&buf, "{{\"event\":\"cron_job_start\",\"task\":{f},\"channel\":{f},\"bot_account\":{f}}}", .{ std.json.fmt(task_detail, .{}), std.json.fmt(ch, .{}), std.json.fmt(bot, .{}) }) catch return;
+                        }
+                        break :blk std.fmt.bufPrint(&buf, "{{\"event\":\"cron_job_start\",\"channel\":{f},\"bot_account\":{f}}}", .{ std.json.fmt(ch, .{}), std.json.fmt(bot, .{}) }) catch return;
+                    }
+                    if (task) |task_detail| {
+                        break :blk std.fmt.bufPrint(&buf, "{{\"event\":\"cron_job_start\",\"task\":{f},\"channel\":{f}}}", .{ std.json.fmt(task_detail, .{}), std.json.fmt(ch, .{}) }) catch return;
+                    }
                     break :blk std.fmt.bufPrint(&buf, "{{\"event\":\"cron_job_start\",\"channel\":{f}}}", .{std.json.fmt(ch, .{})}) catch return;
+                }
+                if (e.bot_account) |bot| {
+                    if (task) |task_detail| {
+                        break :blk std.fmt.bufPrint(&buf, "{{\"event\":\"cron_job_start\",\"task\":{f},\"bot_account\":{f}}}", .{ std.json.fmt(task_detail, .{}), std.json.fmt(bot, .{}) }) catch return;
+                    }
+                    break :blk std.fmt.bufPrint(&buf, "{{\"event\":\"cron_job_start\",\"bot_account\":{f}}}", .{std.json.fmt(bot, .{})}) catch return;
+                }
+                if (task) |task_detail| {
+                    break :blk std.fmt.bufPrint(&buf, "{{\"event\":\"cron_job_start\",\"task\":{f}}}", .{std.json.fmt(task_detail, .{})}) catch return;
                 }
                 break :blk std.fmt.bufPrint(&buf, "{{\"event\":\"cron_job_start\"}}", .{}) catch return;
             },
@@ -882,14 +941,24 @@ pub const OtelObserver = struct {
                 });
             },
             .subagent_start => |e| {
-                self.addSpan("subagent.start", now, now, &.{
-                    .{ .key = "agent_name", .value = e.agent_name },
-                });
+                var attrs: [2]OtelAttribute = undefined;
+                var attr_len: usize = 0;
+                attrs[attr_len] = .{ .key = "agent_name", .value = e.agent_name };
+                attr_len += 1;
+                if (eventDetailForObserver(e.task)) |task| {
+                    attrs[attr_len] = .{ .key = "task", .value = task };
+                    attr_len += 1;
+                }
+                self.addSpan("subagent.start", now, now, attrs[0..attr_len]);
             },
             .cron_job_start => |e| {
                 self.startCurrentTrace(now);
-                var attrs: [2]OtelAttribute = undefined;
+                var attrs: [3]OtelAttribute = undefined;
                 var attr_len: usize = 0;
+                if (eventDetailForObserver(e.task)) |task| {
+                    attrs[attr_len] = .{ .key = "task", .value = task };
+                    attr_len += 1;
+                }
                 if (e.channel) |ch| {
                     attrs[attr_len] = .{ .key = "channel", .value = ch };
                     attr_len += 1;
@@ -1315,6 +1384,9 @@ test "FileObserver handles all event types" {
         .{ .channel_message = .{ .channel = "cli", .direction = "inbound" } },
         .{ .heartbeat_tick = {} },
         .{ .err = .{ .component = "test", .message = "error" } },
+        .{ .subagent_start = .{ .agent_name = "worker", .task = "review diff" } },
+        .{ .cron_job_start = .{ .task = "nightly report", .channel = "telegram", .bot_account = "bot-a" } },
+        .{ .skill_load = .{ .name = "reviewer", .duration_ms = 12 } },
     };
     for (&events) |*event| {
         obs.recordEvent(event);
@@ -1450,6 +1522,42 @@ test "FileObserver emits valid escaped JSONL" {
     try std.testing.expectEqualStrings("line1\nline2\\tail", parsed.value.object.get("message").?.string);
 }
 
+test "FileObserver persists task details for subagent and cron events" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const path = try std.fmt.allocPrint(allocator, "{s}/obs_task_events.jsonl", .{base});
+    defer allocator.free(path);
+
+    var file_obs = FileObserver{ .path = path };
+    const obs = file_obs.observer();
+    const subagent = ObserverEvent{ .subagent_start = .{
+        .agent_name = "delegate",
+        .task = "inspect scheduler telemetry",
+    } };
+    const cron = ObserverEvent{ .cron_job_start = .{
+        .task = "send daily digest",
+        .channel = "telegram",
+        .bot_account = "bot-main",
+    } };
+    obs.recordEvent(&subagent);
+    obs.recordEvent(&cron);
+
+    const file = try std.fs.openFileAbsolute(path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(allocator, 4096);
+    defer allocator.free(content);
+
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"event\":\"subagent_start\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"task\":\"inspect scheduler telemetry\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"event\":\"cron_job_start\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"channel\":\"telegram\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"bot_account\":\"bot-main\"") != null);
+}
+
 // ── Additional observability tests ──────────────────────────────
 
 test "VerboseObserver does not panic on events" {
@@ -1476,6 +1584,9 @@ test "VerboseObserver handles all event types" {
         .{ .channel_message = .{ .channel = "cli", .direction = "inbound" } },
         .{ .heartbeat_tick = {} },
         .{ .err = .{ .component = "test", .message = "error" } },
+        .{ .subagent_start = .{ .agent_name = "worker", .task = "review diff" } },
+        .{ .cron_job_start = .{ .task = "nightly report", .channel = "telegram", .bot_account = "bot-a" } },
+        .{ .skill_load = .{ .name = "reviewer", .duration_ms = 12 } },
     };
     for (&events) |*event| {
         obs.recordEvent(event);
@@ -1821,6 +1932,56 @@ test "OtelObserver span attributes" {
     try std.testing.expectEqualStrings("openrouter", span.attributes.items[0].value);
     try std.testing.expectEqualStrings("model", span.attributes.items[1].key);
     try std.testing.expectEqualStrings("claude", span.attributes.items[1].value);
+}
+
+test "OtelObserver subagent and cron spans include task attribution" {
+    var otel = OtelObserver.init(std.testing.allocator, null, null);
+    defer otel.deinit();
+    const obs = otel.observer();
+
+    const subagent = ObserverEvent{ .subagent_start = .{
+        .agent_name = "delegate",
+        .task = "inspect scheduler telemetry",
+    } };
+    const cron = ObserverEvent{ .cron_job_start = .{
+        .task = "send daily digest",
+        .channel = "telegram",
+        .bot_account = "bot-main",
+    } };
+    obs.recordEvent(&subagent);
+    obs.recordEvent(&cron);
+
+    try std.testing.expectEqual(@as(usize, 2), otel.spans.items.len);
+    try std.testing.expectEqualStrings("subagent.start", otel.spans.items[0].name);
+    try std.testing.expectEqualStrings("task", otel.spans.items[0].attributes.items[1].key);
+    try std.testing.expectEqualStrings("inspect scheduler telemetry", otel.spans.items[0].attributes.items[1].value);
+    try std.testing.expectEqualStrings("cron.job.start", otel.spans.items[1].name);
+    try std.testing.expectEqualStrings("task", otel.spans.items[1].attributes.items[0].key);
+    try std.testing.expectEqualStrings("send daily digest", otel.spans.items[1].attributes.items[0].value);
+    try std.testing.expectEqualStrings("channel", otel.spans.items[1].attributes.items[1].key);
+    try std.testing.expectEqualStrings("telegram", otel.spans.items[1].attributes.items[1].value);
+    try std.testing.expectEqualStrings("bot_account", otel.spans.items[1].attributes.items[2].key);
+    try std.testing.expectEqualStrings("bot-main", otel.spans.items[1].attributes.items[2].value);
+}
+
+test "OtelObserver spans build on observability extension event types" {
+    var otel = OtelObserver.init(std.testing.allocator, null, null);
+    defer otel.deinit();
+    const obs = otel.observer();
+
+    const events = [_]ObserverEvent{
+        .{ .subagent_start = .{ .agent_name = "worker", .task = "review diff" } },
+        .{ .cron_job_start = .{ .task = "nightly report", .channel = "telegram", .bot_account = "bot-a" } },
+        .{ .skill_load = .{ .name = "reviewer", .duration_ms = 12 } },
+    };
+    for (&events) |*event| {
+        obs.recordEvent(event);
+    }
+
+    try std.testing.expectEqual(@as(usize, 3), otel.spans.items.len);
+    try std.testing.expectEqualStrings("subagent.start", otel.spans.items[0].name);
+    try std.testing.expectEqualStrings("cron.job.start", otel.spans.items[1].name);
+    try std.testing.expectEqualStrings("skill.load", otel.spans.items[2].name);
 }
 
 test "OtelObserver tool_call includes detail attribute" {
