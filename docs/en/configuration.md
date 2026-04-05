@@ -825,6 +825,18 @@ Recommended defaults:
 
 Avoid direct public exposure. Use tunnel when external access is required.
 
+| Field | Default | Description |
+|-------|---------|-------------|
+| `host` | `"127.0.0.1"` | Listen address |
+| `port` | `3000` | Listen port |
+| `require_pairing` | `true` | Require bearer token on all API requests |
+| `allow_public_bind` | `false` | Allow binding to non-loopback addresses |
+| `pair_rate_limit_per_minute` | `10` | Max `/pair` requests per minute per IP |
+| `webhook_rate_limit_per_minute` | `60` | Max webhook requests per minute per IP |
+| `idempotency_ttl_secs` | `300` | Duration to cache idempotent request results |
+| `max_body_size_bytes` | `65536` | Maximum HTTP request body size in bytes (64 KB). Raise this when accepting image or file payloads (e.g. `20971520` for 20 MB). |
+| `request_timeout_secs` | `30` | Socket read timeout for incoming HTTP requests in seconds. Raise this when accepting large payloads over slow connections. |
+
 ### `tunnel`
 
 Tunnel providers for exposing the gateway to the public internet. Required for webhook-based channels when running without a public IP.

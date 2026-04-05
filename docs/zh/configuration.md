@@ -636,6 +636,18 @@ Max 说明：
   - `require_pairing = true`
 - 不建议直接公网监听；如需外网访问，优先使用 tunnel。
 
+| 字段 | 默认值 | 说明 |
+|------|--------|------|
+| `host` | `"127.0.0.1"` | 监听地址 |
+| `port` | `3000` | 监听端口 |
+| `require_pairing` | `true` | 所有 API 请求均需 bearer token |
+| `allow_public_bind` | `false` | 允许绑定非回环地址 |
+| `pair_rate_limit_per_minute` | `10` | 每 IP 每分钟最大 `/pair` 请求数 |
+| `webhook_rate_limit_per_minute` | `60` | 每 IP 每分钟最大 webhook 请求数 |
+| `idempotency_ttl_secs` | `300` | 幂等请求结果缓存时长（秒） |
+| `max_body_size_bytes` | `65536` | HTTP 请求体最大字节数（64 KB）。接受图片或文件负载时需调高（如 `20971520` 表示 20 MB）。 |
+| `request_timeout_secs` | `30` | 入站 HTTP 请求的 socket 读取超时（秒）。在慢速或高延迟连接下接受大体积负载时需调高。 |
+
 ### `tunnel`
 
 隧道服务，用于将本地网关暴露到公网。当没有公网 IP 但需要接收 webhook 回调时使用。
